@@ -633,6 +633,40 @@ class CnnEncoderLayer(BaseModule):
         return out
 
 
+
+class CrossEncoderFusion(nn.Module):
+    """Cross Encoder Fusion module for LEFormer.
+
+    This module handles the fusion of CNN and Transformer encoder outputs.
+    """
+
+    def __init__(self):
+        super(CrossEncoderFusion, self).__init__()
+
+    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, fusion_conv_layers, out_indices):
+        outs = []
+        cnn_encoder_out = x
+
+        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(
+                zip(cnn_encoder_layers, transformer_encoder_layers)):
+            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
+            x, hw_shape = transformer_encoder_layer[0](x)
+            for block in transformer_encoder_layer[1]:
+                x = block(x, hw_shape)
+
+            x = transformer_encoder_layer[2](x)
+            x = nlc_to_nchw(x, hw_shape)
+
+            x = torch.cat((x, cnn_encoder_out), dim=1)
+            
+            x = fusion_conv_layers[i](x)
+
+            if i in out_indices:
+                outs.append(x)
+        return outs
+
+
+
 @BACKBONES.register_module()
 class LEFormer(BaseModule):
     """The backbone of LEFormer.
@@ -698,6 +732,8 @@ class LEFormer(BaseModule):
                  init_cfg=None,
                  with_cp=False):
         super(LEFormer, self).__init__(init_cfg=init_cfg)
+
+        self.cross_encoder_fusion=CrossEncoderFusion()
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -807,20 +843,11 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
-        outs = []
-        cnn_encoder_out = x
+            return self.cross_encoder_fusion(
+                x,
+                cnn_encoder_layers=self.cnn_encoder_layers,
+                transformer_encoder_layers=self.transformer_encoder_layers,
+                fusion_conv_layers=self.fusion_conv_layers,
+                out_indices=self.out_indices
+            )
 
-        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(
-                zip(self.cnn_encoder_layers, self.transformer_encoder_layers)):
-            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
-            x, hw_shape = transformer_encoder_layer[0](x)
-            for block in transformer_encoder_layer[1]:
-                x = block(x, hw_shape)
-            x = transformer_encoder_layer[2](x)
-            x = nlc_to_nchw(x, hw_shape)
-            x = torch.cat((x, cnn_encoder_out), dim=1)
-            x = self.fusion_conv_layers[i](x)
-
-            if i in self.out_indices:
-                outs.append(x)
-        return outs
