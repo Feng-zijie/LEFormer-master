@@ -50,42 +50,54 @@ class MobiVari2(MobiVari1):  # MobileNet v2 Variants
         flops += H * W * 1 * 1 * self.expand_dim * self.out_dim  # self.pw_conv
         return flops
 
-class HRAMi(nn.Module): 
+class HRAMi(nn.Module):
     def __init__(self, dim, kernel_size=3, stride=1, mv_ver=1, mv_act=nn.LeakyReLU, exp_factor=1.2, expand_groups=4):
         super(HRAMi, self).__init__()
-
         self.dim = dim
         self.kernel_size = kernel_size
 
-        if mv_ver == 1:
-            self.mobivari = MobiVari1(dim + dim // 4 + dim // 16 + dim, kernel_size, stride, act=mv_act, out_dim=dim)
-        elif mv_ver == 2:
-            self.mobivari = MobiVari2(dim + dim // 4 + dim // 16 + dim, kernel_size, stride, act=mv_act, out_dim=dim,
-                                      exp_factor=2., expand_groups=1)
+        # 自动计算输入通道数
+        self.in_dim = None  # 运行时动态计算
+
+        self.mv_ver = mv_ver
+        self.mv_act = mv_act
+        self.exp_factor = exp_factor
+        self.expand_groups = expand_groups
 
     def forward(self, attn_list):
+        # 计算实际输入通道
+        in_dim = sum([attn.shape[1] for attn in attn_list])
+
+        # 初始化 MobiVari（仅第一次 forward 运行时）
+        if self.in_dim is None:
+            self.in_dim = in_dim
+            if self.mv_ver == 1:
+                self.mobivari = MobiVari1(self.in_dim, self.kernel_size, 1, act=self.mv_act, out_dim=self.dim)
+            else:
+                self.mobivari = MobiVari2(self.in_dim, self.kernel_size, 1, act=self.mv_act, out_dim=self.dim,
+                                          exp_factor=self.exp_factor, expand_groups=self.expand_groups)
+        
+        # 进行特征融合
         for i, attn in enumerate(attn_list[:-1]):
             attn = F.pixel_shuffle(attn, 2 ** i)
             x = attn if i == 0 else torch.cat([x, attn], dim=1)
+
         x = torch.cat([x, attn_list[-1]], dim=1)
         x = self.mobivari(x)
         return x
+
 
     def flops(self, resolutions):
         return self.mobivari.flops(resolutions)
 
 
 if __name__ == '__main__':
-    hrami = HRAMi(dim=64)
-
+    hrami = HRAMi(dim=160)
+    x=torch.randn(16, 160, 64, 64)
+    y=torch.randn(16, 160, 64, 64)
     # Create sample input tensors
     # Assume the input tensors have spatial dimensions of 32x32, 16x16, 8x8, etc.
-    input = [
-        torch.randn(1, 64, 32, 32),  # Level 0
-        torch.randn(1, 64, 16, 16),  # Level 1
-        torch.randn(1, 64, 8, 8),  # Level 2
-        torch.randn(1, 64, 32, 32)  # Level 3 (final level)
-    ]
+    input = [x,y]
 
     # Pass the input through HRAMi
     output = hrami(input)

@@ -754,7 +754,7 @@ class CrossEncoderFusion(nn.Module):
 
 """
 
-# cross 变体1
+# cross 变体1 (ResNet => cnn的原始特征+ fusion后的特征)
 """
 class ConvBlock(nn.Module):
     def __init__(self, inplanes, outplanes, stride=1, res_conv=False, act_layer=nn.ReLU, groups=1,
@@ -833,9 +833,9 @@ class CrossEncoderFusion(nn.Module):
     
 """
 
-# cross 变体2
+# cross 变体2 (DenseNet)
+"""
 class DenseLayer(nn.Module):
-    """Dense Block 内部的一层"""
     def __init__(self, in_channels, growth_rate):
         super(DenseLayer, self).__init__()
         self.bn1 = nn.BatchNorm2d(in_channels)
@@ -850,7 +850,6 @@ class DenseLayer(nn.Module):
         return torch.cat([x, out], dim=1)  # 维度拼接，增加通道数
 
 class DenseBlock(nn.Module):
-    """包含多个 DenseLayer,并使用 1x1 卷积降维"""
     def __init__(self, num_layers, in_channels, growth_rate, out_channels):
         super(DenseBlock, self).__init__()
         self.layers = nn.ModuleList()
@@ -906,9 +905,169 @@ class CrossEncoderFusion(nn.Module):
 
         return outs
 
+"""
 
 
+"""
+class CrossEncoderFusion(nn.Module):
+    def __init__(self):
+        super(CrossEncoderFusion, self).__init__()
 
+    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, fusion_conv_layers, out_indices):
+        outs = []
+        cnn_encoder_out = x
+
+        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(
+                zip(cnn_encoder_layers, transformer_encoder_layers)):
+            
+            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out) # [16, 3, 256, 256] → [16, 32, 128, 128] → [16, 64, 64, 64] → [16, 128, 32, 32] → [16, 256, 16, 16]
+            
+            x, hw_shape = transformer_encoder_layer[0](x)
+            for block in transformer_encoder_layer[1]:
+                x = block(x, hw_shape)
+
+            
+            # 过了block后的x的shape
+            # torch.Size([16, 4096, 32])   torch.Size([16, 1024, 64])  torch.Size([16, 256, 160])  torch.Size([16, 64, 192])
+
+            x = transformer_encoder_layer[2](x)
+            x = nlc_to_nchw(x, hw_shape)
+
+            # 到这里 x的shape是 torch.Size([16, 32, 64, 64])  torch.Size([16, 64, 32, 32])  torch.Size([16, 160, 16, 16])  torch.Size([16, 192, 8, 8])
+            print("-"*100)
+            print(x.shape)
+            print("-"*100)
+
+            x = torch.cat((x, cnn_encoder_out), dim=1)
+            
+            x = fusion_conv_layers[i](x)
+
+            if i in out_indices:
+                outs.append(x)
+        return outs
+"""
+
+# cross 变体3 (HRAMi 模块)
+class MobiVari1(nn.Module):  # MobileNet v1 Variants
+    def __init__(self, dim, kernel_size, stride, act=nn.LeakyReLU, out_dim=None):
+        super(MobiVari1, self).__init__()
+        self.dim = dim
+        self.kernel_size = kernel_size
+        self.out_dim = out_dim or dim
+
+        self.dw_conv = nn.Conv2d(dim, dim, kernel_size, stride, kernel_size // 2, groups=dim)
+        self.pw_conv = nn.Conv2d(dim, self.out_dim, 1, 1, 0)
+        self.act = act()
+
+    def forward(self, x):
+        out = self.act(self.pw_conv(self.act(self.dw_conv(x)) + x))
+        return out + x if self.dim == self.out_dim else out
+
+    def flops(self, resolutions):
+        H, W = resolutions
+        flops = H * W * self.kernel_size * self.kernel_size * self.dim + H * W * 1 * 1 * self.dim * self.out_dim  # self.dw_conv + self.pw_conv
+        return flops
+
+
+class MobiVari2(MobiVari1):  # MobileNet v2 Variants
+    def __init__(self, dim, kernel_size, stride, act=nn.LeakyReLU, out_dim=None, exp_factor=1.2, expand_groups=4):
+        super(MobiVari2, self).__init__(dim, kernel_size, stride, act, out_dim)
+        self.expand_groups = expand_groups
+        expand_dim = int(dim * exp_factor)
+        expand_dim = expand_dim + (expand_groups - expand_dim % expand_groups)
+        self.expand_dim = expand_dim
+
+        self.exp_conv = nn.Conv2d(dim, self.expand_dim, 1, 1, 0, groups=expand_groups)
+        self.dw_conv = nn.Conv2d(expand_dim, expand_dim, kernel_size, stride, kernel_size // 2, groups=expand_dim)
+        self.pw_conv = nn.Conv2d(expand_dim, self.out_dim, 1, 1, 0)
+
+    def forward(self, x):
+        x1 = self.act(self.exp_conv(x))
+        out = self.pw_conv(self.act(self.dw_conv(x1) + x1))
+        return out + x if self.dim == self.out_dim else out
+
+    def flops(self, resolutions):
+        H, W = resolutions
+        flops = H * W * 1 * 1 * (self.dim // self.expand_groups) * self.expand_dim  # self.exp_conv
+        flops += H * W * self.kernel_size * self.kernel_size * self.expand_dim  # self.dw_conv
+        flops += H * W * 1 * 1 * self.expand_dim * self.out_dim  # self.pw_conv
+        return flops
+
+class HRAMi(nn.Module):
+    def __init__(self, dim, kernel_size=3, stride=1, mv_ver=1, mv_act=nn.LeakyReLU, exp_factor=1.2, expand_groups=4):
+        super(HRAMi, self).__init__()
+        self.dim = dim
+        self.kernel_size = kernel_size
+
+        # 自动计算输入通道数
+        self.in_dim = None  # 运行时动态计算
+
+        self.mv_ver = mv_ver
+        self.mv_act = mv_act
+        self.exp_factor = exp_factor
+        self.expand_groups = expand_groups
+
+    def forward(self, attn_list):
+        # 计算实际输入通道
+        in_dim = sum([attn.shape[1] for attn in attn_list])
+        device = attn_list[0].device  # 获取输入张量的设备
+
+        # 初始化 MobiVari（仅第一次 forward 运行时）
+        if self.in_dim is None:
+            self.in_dim = in_dim
+            if self.mv_ver == 1:
+                self.mobivari = MobiVari1(self.in_dim, self.kernel_size, 1, act=self.mv_act, out_dim=self.dim).to(device)
+            else:
+                self.mobivari = MobiVari2(self.in_dim, self.kernel_size, 1, act=self.mv_act, out_dim=self.dim,
+                                          exp_factor=self.exp_factor, expand_groups=self.expand_groups).to(device)
+        
+        # 进行特征融合
+        for i, attn in enumerate(attn_list[:-1]):
+            attn = F.pixel_shuffle(attn, 2 ** i)
+            x = attn if i == 0 else torch.cat([x, attn], dim=1)
+
+        x = torch.cat([x, attn_list[-1]], dim=1)
+        x = self.mobivari(x)
+        return x
+
+
+    def flops(self, resolutions):
+        return self.mobivari.flops(resolutions)
+
+class CrossEncoderFusion(nn.Module):
+    def __init__(self):
+        super(CrossEncoderFusion, self).__init__()
+
+    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, out_indices):
+        outs = []
+        cnn_encoder_out = x
+
+        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(
+                zip(cnn_encoder_layers, transformer_encoder_layers)):
+            
+            # 确保 cnn_encoder_layer 在正确的设备上
+            cnn_encoder_layer = cnn_encoder_layer.to(x.device)
+            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
+
+            # 确保 transformer_encoder_layer 在正确的设备上
+            transformer_encoder_layer = [layer.to(x.device) for layer in transformer_encoder_layer]
+            x, hw_shape = transformer_encoder_layer[0](x)
+            for block in transformer_encoder_layer[1]:
+                x = block(x, hw_shape)
+
+            x = transformer_encoder_layer[2](x)
+            x = nlc_to_nchw(x, hw_shape)
+
+            # 确保 HRAMi 在正确的设备上
+            _, C, H, W = x.shape
+            device = x.device
+            hrami = HRAMi(dim=C).to(device)
+            input = [x, cnn_encoder_out]
+            x = hrami(input)
+
+            if i in out_indices:
+                outs.append(x)
+        return outs
 
 @BACKBONES.register_module()
 class LEFormer(BaseModule):
@@ -987,6 +1146,7 @@ class LEFormer(BaseModule):
         ]
         """
         # cross 变体2
+        """
         self.fusion_out_channels1 = [
             (64, 16, 4, 32),  
             (128, 32, 4, 64),  
@@ -999,11 +1159,10 @@ class LEFormer(BaseModule):
             (320, 64, 2, 160),
             (384,128, 2, 192)
         ]
+        """
 
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels)
 
-        # self.cross_encoder_fusion=CrossEncoderFusion() 原本的
-
+        self.cross_encoder_fusion=CrossEncoderFusion()
 
 
         assert not (init_cfg and pretrained), \
@@ -1114,19 +1273,15 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
-            # return self.cross_encoder_fusion(
-            #     x,
-            #     cnn_encoder_layers=self.cnn_encoder_layers,
-            #     transformer_encoder_layers=self.transformer_encoder_layers,
-            #     fusion_conv_layers=self.fusion_conv_layers,
-            #     out_indices=self.out_indices
-            # )
+            # 确保输入张量和模型在同一设备上
+            device = next(self.parameters()).device
+            x = x.to(device)
 
-             return self.cross_encoder_fusion(
+            return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,
                 transformer_encoder_layers=self.transformer_encoder_layers,
-                # fusion_conv_layers=self.fusion_conv_layers,
                 out_indices=self.out_indices
             )
+
 
