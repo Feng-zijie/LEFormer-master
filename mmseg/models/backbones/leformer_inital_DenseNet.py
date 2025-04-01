@@ -894,23 +894,11 @@ class LEFormer(BaseModule):
         super(LEFormer, self).__init__(init_cfg=init_cfg)
 
         # cross 变体
-        self.fusion_out_channels_5 = [
-            (64, 16, 5, 32),  
-            (128, 32, 5, 64),  
-            (320, 64, 5, 160),
-            (384,128, 5, 192)
-        ]
         self.fusion_out_channels_4 = [
             (64, 16, 4, 32),  
             (128, 32, 4, 64),  
             (320, 64, 4, 160),
             (384,128, 4, 192)
-        ]
-        self.fusion_out_channels_3 = [
-            (64, 16, 3, 32),  
-            (128, 32, 3, 64),  
-            (320, 64, 3, 160),
-            (384,128, 3, 192)
         ]
         self.fusion_out_channels_2 = [
             (64, 16, 2, 32),  
