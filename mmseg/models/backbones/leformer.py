@@ -635,22 +635,6 @@ class MultiscaleCBAMLayer(BaseModule):
 #         return out
 
 class CnnEncoderLayer(BaseModule):
-    """Implements one cnn encoder layer in LEFormer.
-
-        Args:
-            embed_dims (int): The feature dimension.
-            feedforward_channels (int): The hidden dimension for FFNs.
-            output_channels (int): The output channles of each cnn encoder layer.
-            kernel_size (int): The kernel size of Conv2d. Default: 3.
-            stride (int): The stride of Conv2d. Default: 2.
-            padding (int): The padding of Conv2d. Default: 0.
-            act_cfg (dict): The activation config for FFNs.
-                Default: dict(type='GELU').
-            ffn_drop (float, optional): Probability of an element to be
-                zeroed in FFN. Default 0.0.
-            init_cfg (dict, optional): Initialization config dict.
-                Default: None.
-        """
 
     def __init__(self,
                  embed_dims,
@@ -919,7 +903,7 @@ class LEFormer(BaseModule):
             (384,128, 2, 192)
         ]
 
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_4)
+        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_3)
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'

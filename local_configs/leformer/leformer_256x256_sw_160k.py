@@ -16,9 +16,11 @@ optimizer = dict(
         custom_keys={
             'pos_block': dict(decay_mult=0.),
             'norm': dict(decay_mult=0.),
-            'head': dict(lr_mult=10.)
+            'head': dict(lr_mult=5.), # 原始的 'head': dict(lr_mult=10.)
+            # 'backbone': dict(lr_mult=0.5) # 后来加的
         }))
 
+# 原始的
 lr_config = dict(
     _delete_=True,
     policy='poly',
@@ -29,15 +31,15 @@ lr_config = dict(
     min_lr=0.0,
     by_epoch=False)
 
-##  work_dirs/9_DenseNet_layer*4_lr_config
+# ##  work_dirs/9_DenseNet_layer*4_lr_config   work_dirs/18_DenseNet_layer*3_lr_0.0001+weight_decay_0.05+lr_config+paramwise_cfg
 # lr_config = dict(
 #     _delete_=True,
 #     policy='poly',
 #     warmup='linear',
 #     warmup_iters=1000,
 #     warmup_ratio=1e-5,
-#     power=1.2,
-#     min_lr=1e-6,
+#     power=1.0,
+#     min_lr=0.0,
 #     by_epoch=False)
 
 data = dict(samples_per_gpu=16, workers_per_gpu=4)
