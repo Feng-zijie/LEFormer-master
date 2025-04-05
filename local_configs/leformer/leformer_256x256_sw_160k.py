@@ -9,7 +9,7 @@ model = dict(pretrained=None, decode_head=dict(num_classes=2))
 optimizer = dict(
     _delete_=True,
     type='AdamW',
-    lr=0.0001, # 原始的 lr=0.00006
+    lr=0.0003, # 原始的 lr=0.00006
     betas=(0.9, 0.999), 
     weight_decay=0.05, # 原始的 weight_decay=0.01
     paramwise_cfg=dict(
@@ -20,7 +20,7 @@ optimizer = dict(
             # 'backbone': dict(lr_mult=0.5) # 后来加的
         }))
 
-# 原始的
+# # 原始的
 lr_config = dict(
     _delete_=True,
     policy='poly',
@@ -31,7 +31,7 @@ lr_config = dict(
     min_lr=0.0,
     by_epoch=False)
 
-# ##  work_dirs/9_DenseNet_layer*4_lr_config   work_dirs/18_DenseNet_layer*3_lr_0.0001+weight_decay_0.05+lr_config+paramwise_cfg
+# ##  work_dirs/9_DenseNet_layer*4_lr_config   work_dirs/18 ,19 ,20
 # lr_config = dict(
 #     _delete_=True,
 #     policy='poly',

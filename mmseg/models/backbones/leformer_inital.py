@@ -582,58 +582,6 @@ class MultiscaleCBAMLayer(BaseModule):
         return out
 
 
-# class CnnEncoderLayer(BaseModule):
-#     """Implements one cnn encoder layer in LEFormer.
-
-#         Args:
-#             embed_dims (int): The feature dimension.
-#             feedforward_channels (int): The hidden dimension for FFNs.
-#             output_channels (int): The output channles of each cnn encoder layer.
-#             kernel_size (int): The kernel size of Conv2d. Default: 3.
-#             stride (int): The stride of Conv2d. Default: 2.
-#             padding (int): The padding of Conv2d. Default: 0.
-#             act_cfg (dict): The activation config for FFNs.
-#                 Default: dict(type='GELU').
-#             ffn_drop (float, optional): Probability of an element to be
-#                 zeroed in FFN. Default 0.0.
-#             init_cfg (dict, optional): Initialization config dict.
-#                 Default: None.
-#         """
-
-#     def __init__(self,
-#                  embed_dims,
-#                  feedforward_channels,
-#                  output_channels,
-#                  kernel_size=3,
-#                  stride=2,
-#                  padding=0,
-#                  act_cfg=dict(type='GELU'),
-#                  ffn_drop=0.,
-#                  init_cfg=None):
-#         super(CnnEncoderLayer, self).__init__(init_cfg)
-
-#         self.embed_dims = embed_dims
-#         self.feedforward_channels = feedforward_channels
-#         self.output_channels = output_channels
-#         self.act_cfg = act_cfg
-#         self.activate = build_activation_layer(act_cfg)
-
-#         self.layers = DepthWiseConvModule(embed_dims=embed_dims,
-#                                           feedforward_channels=feedforward_channels // 2,
-#                                           output_channels=output_channels,
-#                                           kernel_size=kernel_size,
-#                                           stride=stride,
-#                                           padding=padding,
-#                                           act_cfg=dict(type='GELU'),
-#                                           ffn_drop=ffn_drop)
-
-#         self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
-
-#     def forward(self, x):
-#         out = self.layers(x)
-#         out = self.multiscale_cbam(out)
-#         return out
-
 class CnnEncoderLayer(BaseModule):
     """Implements one cnn encoder layer in LEFormer.
 
@@ -679,47 +627,15 @@ class CnnEncoderLayer(BaseModule):
                                           act_cfg=dict(type='GELU'),
                                           ffn_drop=ffn_drop)
 
-        self.norm = nn.BatchNorm2d(output_channels)
         self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
 
-        self.residual = nn.ModuleList([
-            # 将 bias = False 改变为 bias = True
-            nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),  # 普通残差  
-            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),  # 下采样残差
-            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),  # 下采样残差
-            nn.Sequential(  # 带 BN 的残差
-                nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
-                nn.BatchNorm2d(output_channels)
-            )
-        ])
-
     def forward(self, x):
-
-        # [16,3,256,256] -> [16,32,64,64] -> [16,32,64,64]
-
         out = self.layers(x)
         out = self.multiscale_cbam(out)
-
-        _, _, H, W=out.shape
-
-        if H == 64:
-            identity = self.residual[0](x)
-        elif H == 32:
-            identity = self.residual[1](x)
-        elif H == 16:
-            identity = self.residual[2](x)
-        else:
-            identity = self.residual[3](x)
-
-        if identity.shape != out.shape:
-            print(f"mismatch: identity={identity.shape}, out={out.shape}")
-            identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
-
-        out += identity
         return out
 
+
 # 原始的
-"""
 class CrossEncoderFusion(nn.Module):
     def __init__(self):
         super(CrossEncoderFusion, self).__init__()
@@ -751,164 +667,6 @@ class CrossEncoderFusion(nn.Module):
             if i in out_indices:
                 outs.append(x)
         return outs
-
-"""
-
-# cross 变体1
-"""
-class ConvBlock(nn.Module):
-    def __init__(self, inplanes, outplanes, stride=1, res_conv=False, act_layer=nn.ReLU, groups=1,
-                 norm_layer=partial(nn.BatchNorm2d, eps=1e-6), drop_block=None, drop_path=None):
-        super(ConvBlock, self).__init__()
-
-        expansion = 4
-        med_planes = outplanes // expansion
-
-        self.conv1 = nn.Conv2d(2*inplanes, inplanes, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn1 = norm_layer(inplanes)
-        self.act1 = act_layer(inplace=True)
-
-        self.conv2 = nn.Conv2d(inplanes, med_planes, kernel_size=3, stride=stride, groups=groups, padding=1, bias=False)
-        self.bn2 = norm_layer(med_planes)
-        self.act2 = act_layer(inplace=True)
-
-        self.conv3 = nn.Conv2d(med_planes, outplanes, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn3 = norm_layer(outplanes)
-        self.act3 = act_layer(inplace=True)
-
-        if res_conv:
-            self.residual_conv = nn.Conv2d(inplanes, outplanes, kernel_size=1, stride=stride, padding=0, bias=False)
-            self.residual_bn = norm_layer(outplanes)
-
-        self.res_conv = res_conv
-        self.drop_block = drop_block
-        self.drop_path = drop_path
-
-    def forward(self, x, x_t=None):
-        residual = x
-
-        x = torch.cat((x, x_t), dim=1)
-        x= self.act1(self.bn1(self.conv1(x)))
-        x= self.act2(self.bn2(self.conv2(x)))
-        x= self.bn3(self.conv3(x))
-
-        if self.res_conv:
-            residual = self.residual_conv(residual)
-            residual = self.residual_bn(residual)
-
-        x += residual
-        x = self.act3(x)
-
-        return x
-
-class CrossEncoderFusion(nn.Module):
-    def __init__(self, fusion_out_channels):
-        super(CrossEncoderFusion, self).__init__()
-        self.fusion_blocks = nn.ModuleList([
-            ConvBlock(inplanes, outplanes) for inplanes, outplanes in fusion_out_channels
-        ])
-
-    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, out_indices):
-        outs = []
-        cnn_encoder_out = x
-
-        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(
-                zip(cnn_encoder_layers, transformer_encoder_layers)):
-            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
-
-            x, hw_shape = transformer_encoder_layer[0](x)
-            for block in transformer_encoder_layer[1]:
-                x = block(x, hw_shape)
-
-            x = transformer_encoder_layer[2](x)
-            x = nlc_to_nchw(x, hw_shape)
-
-            # 直接使用 ConvBlock 进行 CNN 和 Transformer 特征融合
-            x = self.fusion_blocks[i](cnn_encoder_out, x)
-
-            if i in out_indices:
-                outs.append(x)
-
-        return outs
-    
-"""
-
-# cross 变体2
-class DenseLayer(nn.Module):
-    """Dense Block 内部的一层"""
-    def __init__(self, in_channels, growth_rate):
-        super(DenseLayer, self).__init__()
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.conv1 = nn.Conv2d(in_channels, 4 * growth_rate, kernel_size=1, bias=False)
-        
-        self.bn2 = nn.BatchNorm2d(4 * growth_rate)
-        self.conv2 = nn.Conv2d(4 * growth_rate, growth_rate, kernel_size=3, padding=1, bias=False)
-
-    def forward(self, x):
-        out = self.conv1(F.relu(self.bn1(x)))
-        out = self.conv2(F.relu(self.bn2(out)))
-        return torch.cat([x, out], dim=1)  # 维度拼接，增加通道数
-
-class DenseBlock(nn.Module):
-    """包含多个 DenseLayer,并使用 1x1 卷积降维"""
-    def __init__(self, num_layers, in_channels, growth_rate, out_channels):
-        super(DenseBlock, self).__init__()
-        self.layers = nn.ModuleList()
-        current_channels = in_channels  # 记录当前通道数
-        
-        for _ in range(num_layers):
-            self.layers.append(DenseLayer(current_channels, growth_rate))
-            current_channels += growth_rate  # 每层增加 growth_rate 个通道
-        
-        # 使用 1x1 卷积降维到目标通道数
-        self.conv1x1 = nn.Conv2d(current_channels, out_channels, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)  # 逐层拼接
-        x = self.conv1x1(x)  # 1x1 降维
-        x = F.relu(self.bn(x))  # BN + ReLU
-        return x
-
-class CrossEncoderFusion(nn.Module):
-    def __init__(self, fusion_out_channels):
-        super(CrossEncoderFusion, self).__init__()
-        
-        self.fusion_blocks = nn.ModuleList([
-            DenseBlock(num_layers, in_channels, growth_rate, out_channels) 
-            for in_channels, growth_rate, num_layers, out_channels in fusion_out_channels
-        ])
-
-    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, out_indices):
-        outs = []
-        cnn_encoder_out = x
-
-        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(zip(cnn_encoder_layers, transformer_encoder_layers)):
-            # CNN 分支
-            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
-
-            # Transformer 分支
-            x, hw_shape = transformer_encoder_layer[0](x)
-            for block in transformer_encoder_layer[1]:
-                x = block(x, hw_shape)
-            x = transformer_encoder_layer[2](x)
-            x = nlc_to_nchw(x, hw_shape)
-
-            # 拼接 CNN 和 Transformer 特征
-            fusion_input = torch.cat((cnn_encoder_out, x), dim=1)
-
-            # 经过 DenseBlock 进行融合
-            x = self.fusion_blocks[i](fusion_input)
-
-            if i in out_indices:
-                outs.append(x)
-
-        return outs
-
-
-
-
 
 @BACKBONES.register_module()
 class LEFormer(BaseModule):
@@ -976,35 +734,7 @@ class LEFormer(BaseModule):
                  with_cp=False):
         super(LEFormer, self).__init__(init_cfg=init_cfg)
 
-
-        # cross 变体1
-        """        
-        self.fusion_out_channels = [
-            (32, 32),   # 第一层: 输入 64 → 输出 32
-            (64, 64),  # 第二层: 输入 128 → 输出 64
-            (160, 160), # 第三层: 输入 288 → 输出 128
-            (192, 192)  # 第四层: 输入 448 → 输出 192
-        ]
-        """
-        # cross 变体2
-        self.fusion_out_channels1 = [
-            (64, 16, 4, 32),  
-            (128, 32, 4, 64),  
-            (320, 64, 4, 160),
-            (384,128, 4, 192)
-        ]
-        self.fusion_out_channels2 = [
-            (64, 16, 2, 32),  
-            (128, 32, 2, 64),  
-            (320, 64, 2, 160),
-            (384,128, 2, 192)
-        ]
-
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels)
-
-        # self.cross_encoder_fusion=CrossEncoderFusion() 原本的
-
-
+        self.cross_encoder_fusion=CrossEncoderFusion() 
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -1114,19 +844,12 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
-            # return self.cross_encoder_fusion(
-            #     x,
-            #     cnn_encoder_layers=self.cnn_encoder_layers,
-            #     transformer_encoder_layers=self.transformer_encoder_layers,
-            #     fusion_conv_layers=self.fusion_conv_layers,
-            #     out_indices=self.out_indices
-            # )
-
-             return self.cross_encoder_fusion(
+            return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,
                 transformer_encoder_layers=self.transformer_encoder_layers,
-                # fusion_conv_layers=self.fusion_conv_layers,
+                fusion_conv_layers=self.fusion_conv_layers,
                 out_indices=self.out_indices
             )
+
 
