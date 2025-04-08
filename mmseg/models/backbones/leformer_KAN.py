@@ -17,8 +17,7 @@ from mmcv.cnn.utils.weight_init import (constant_init, normal_init,
 from mmcv.runner import BaseModule, ModuleList, Sequential
 
 from ..builder import BACKBONES
-from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
-
+from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw, KANLinear
 
 class DepthWiseConvModule(BaseModule):
     """An implementation of one Depth-wise Conv Module of LEFormer.
@@ -168,42 +167,62 @@ class Pooling(nn.Module):
     def forward(self, x):
         return self.pool(x) - x
 
+class KAN(torch.nn.Module): # 封装了一个KAN神经网络模型，可以用于对数据进行拟合和预测。
+    def __init__(
+        self,
+        layers_hidden=[64, 128, 64],
+        grid_size=5,
+        spline_order=3,
+        scale_noise=0.1,
+        scale_base=1.0,
+        scale_spline=1.0,
+        base_activation=torch.nn.SiLU,
+        grid_eps=0.02,
+        grid_range=[-1, 1],
+    ):
+        super(KAN, self).__init__()
+        self.grid_size = grid_size
+        self.spline_order = spline_order
 
-class Mlp(nn.Module):
-    """Mlp implemented by with 1*1 convolutions.
+        self.layers = torch.nn.ModuleList()
+        for in_features, out_features in zip(layers_hidden, layers_hidden[1:]):
+            self.layers.append(
+                KANLinear(
+                    in_features,
+                    out_features,
+                    grid_size=grid_size,
+                    spline_order=spline_order,
+                    scale_noise=scale_noise,
+                    scale_base=scale_base,
+                    scale_spline=scale_spline,
+                    base_activation=base_activation,
+                    grid_eps=grid_eps,
+                    grid_range=grid_range,
+                )
+            )
 
-    Input: Tensor with shape [B, C, H, W].
-    Output: Tensor with shape [B, C, H, W].
-    Args:
-        in_features (int): Dimension of input features.
-        hidden_features (int): Dimension of hidden features.
-        out_features (int): Dimension of output features.
-        act_cfg (dict): The config dict for activation between pointwise
-            convolution. Defaults to ``dict(type='GELU')``.
-        drop (float): Dropout rate. Defaults to 0.0.
-    """
+    def forward(self, x: torch.Tensor, update_grid=False):  # 调用每个KANLinear层的forward方法，对输入数据进行前向传播计算输出。
+        original_shape = x.shape  # 保存原始形状
+        if x.dim() > 2:  # 如果输入是高维张量，则展平为二维张量
+            x = x.view(-1, x.size(-1))
 
-    def __init__(self,
-                 in_features,
-                 hidden_features=None,
-                 out_features=None,
-                 act_cfg=dict(type='GELU'),
-                 drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Conv2d(in_features, hidden_features, 1)
-        self.act = build_activation_layer(act_cfg)
-        self.fc2 = nn.Conv2d(hidden_features, out_features, 1)
-        self.drop = nn.Dropout(drop)
+        for layer in self.layers:
+            if update_grid:
+                layer.update_grid(x)
+            x = layer(x)
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
+        if len(original_shape) > 2:  # 恢复原始形状
+            x = x.view(*original_shape[:-1], -1)
         return x
+
+    def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):#计算正则化损失的方法，用于约束模型的参数，防止过拟合。
+
+        return sum(
+            layer.regularization_loss(regularize_activation, regularize_entropy)
+            for layer in self.layers
+        )
+
+
 
 
 class PoolingBlock(BaseModule):
@@ -226,7 +245,6 @@ class PoolingBlock(BaseModule):
     def __init__(self,
                  embed_dims,
                  pool_size=3,
-                 mlp_ratio=4.,
                  norm_cfg=dict(type='GN', num_groups=1),
                  act_cfg=dict(type='GELU'),
                  drop=0.,
@@ -237,12 +255,7 @@ class PoolingBlock(BaseModule):
         self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
         self.token_mixer = Pooling(pool_size=pool_size)
         self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
-        mlp_hidden_dim = int(embed_dims * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=embed_dims,
-            hidden_features=mlp_hidden_dim,
-            act_cfg=act_cfg,
-            drop=drop)
+        self.kan = KAN()
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. \
             else nn.Identity()
@@ -257,7 +270,7 @@ class PoolingBlock(BaseModule):
             self.token_mixer(self.norm1(x)))
         x = x + self.drop_path(
             self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) *
-            self.mlp(self.norm2(x)))
+            self.kan(self.norm2(x)))
         return x
 
 
@@ -950,13 +963,7 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
-            # return self.cross_encoder_fusion(
-            #     x,
-            #     cnn_encoder_layers=self.cnn_encoder_layers,
-            #     transformer_encoder_layers=self.transformer_encoder_layers,
-            #     fusion_conv_layers=self.fusion_conv_layers,
-            #     out_indices=self.out_indices
-            # )
+
 
              return self.cross_encoder_fusion(
                 x,
