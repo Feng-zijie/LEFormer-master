@@ -9,7 +9,7 @@ model = dict(pretrained=None, decode_head=dict(num_classes=2))
 optimizer = dict(
     _delete_=True,
     type='AdamW',
-    lr=0.00015, # 原始的 lr=0.00006
+    lr=0.0005, # 原始的 lr=0.00006
     betas=(0.9, 0.999),
     weight_decay=0.05, # 原始的 weight_decay=0.01
     paramwise_cfg=dict(
