@@ -495,91 +495,188 @@ class TransformerEncoderLayer(BaseModule):
         return x
 
 
-class ChannelAttentionModule(BaseModule):
-    """An implementation of one Channel Attention Module of LEFormer.
+# class ChannelAttentionModule(BaseModule):
+#     """An implementation of one Channel Attention Module of LEFormer.
 
-        Args:
-            embed_dims (int): The embedding dimension.
-    """
+#         Args:
+#             embed_dims (int): The embedding dimension.
+#     """
 
-    def __init__(self, embed_dims):
-        super(ChannelAttentionModule, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+#     def __init__(self, embed_dims):
+#         super(ChannelAttentionModule, self).__init__()
+#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+#         self.max_pool = nn.AdaptiveMaxPool2d(1)
 
-        self.shared_MLP = nn.Sequential(
-            Conv2d(embed_dims, embed_dims // 4, 1, bias=False),
-            nn.ReLU(),
-            Conv2d(embed_dims // 4, embed_dims, 1, bias=False)
-        )
+#         self.shared_MLP = nn.Sequential(
+#             Conv2d(embed_dims, embed_dims // 4, 1, bias=False),
+#             nn.ReLU(),
+#             Conv2d(embed_dims // 4, embed_dims, 1, bias=False)
+#         )
 
-        self.sigmoid = nn.Sigmoid()
+#         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        avg_out = self.shared_MLP(self.avg_pool(x))
-        max_out = self.shared_MLP(self.max_pool(x))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-
-class SpatialAttentionModule(BaseModule):
-    """An implementation of one Spatial Attention Module of LEFormer.
-
-        Args:
-            kernel_size (int): The kernel size of Conv2d. Default: 3.
-    """
-
-    def __init__(self, kernel_size=3):
-        super(SpatialAttentionModule, self).__init__()
-
-        padding = 3 if kernel_size == 7 else 1
-
-        self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
+#     def forward(self, x):
+#         avg_out = self.shared_MLP(self.avg_pool(x))
+#         max_out = self.shared_MLP(self.max_pool(x))
+#         out = avg_out + max_out
+#         return self.sigmoid(out)
 
 
-class MultiscaleCBAMLayer(BaseModule):
-    """An implementation of Multiscale CBAM layer of LEFormer.
+# class SpatialAttentionModule(BaseModule):
+#     """An implementation of one Spatial Attention Module of LEFormer.
 
-        Args:
-            embed_dims (int): The feature dimension.
-            kernel_size (int): The kernel size of Conv2d. Default: 7.
-        """
+#         Args:
+#             kernel_size (int): The kernel size of Conv2d. Default: 3.
+#     """
 
-    def __init__(self, embed_dims, kernel_size=7):
-        super(MultiscaleCBAMLayer, self).__init__()
-        self.channel_attention = ChannelAttentionModule(embed_dims // 4)
-        self.spatial_attention = SpatialAttentionModule(kernel_size)
-        self.multiscale_conv = nn.ModuleList()
-        for i in range(1, 5):
-            self.multiscale_conv.append(
-                Conv2d(
-                    in_channels=embed_dims // 4,
-                    out_channels=embed_dims // 4,
-                    kernel_size=3,
-                    stride=1,
-                    padding=(2 * i + 1) // 2,
-                    bias=True,
-                    dilation=(2 * i + 1) // 2)
-            )
+#     def __init__(self, kernel_size=3):
+#         super(SpatialAttentionModule, self).__init__()
 
-    def forward(self, x):
-        outs = torch.split(x, x.shape[1] // 4, dim=1)
-        out_list = []
-        for (i, out) in enumerate(outs):
-            out = self.multiscale_conv[i](out)
-            out = self.channel_attention(out) * out
-            out_list.append(out)
-        out = torch.cat(out_list, dim=1)
-        out = self.spatial_attention(out) * out
+#         padding = 3 if kernel_size == 7 else 1
+
+#         self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+#         self.sigmoid = nn.Sigmoid()
+
+#     def forward(self, x):
+#         avg_out = torch.mean(x, dim=1, keepdim=True)
+#         max_out, _ = torch.max(x, dim=1, keepdim=True)
+#         x = torch.cat([avg_out, max_out], dim=1)
+#         x = self.conv1(x)
+#         return self.sigmoid(x)
+
+
+# class MultiscaleCBAMLayer(BaseModule):
+#     """An implementation of Multiscale CBAM layer of LEFormer.
+
+#         Args:
+#             embed_dims (int): The feature dimension.
+#             kernel_size (int): The kernel size of Conv2d. Default: 7.
+#         """
+
+#     def __init__(self, embed_dims, kernel_size=7):
+#         super(MultiscaleCBAMLayer, self).__init__()
+#         self.channel_attention = ChannelAttentionModule(embed_dims // 4)
+#         self.spatial_attention = SpatialAttentionModule(kernel_size)
+#         self.multiscale_conv = nn.ModuleList()
+#         for i in range(1, 5):
+#             self.multiscale_conv.append(
+#                 Conv2d(
+#                     in_channels=embed_dims // 4,
+#                     out_channels=embed_dims // 4,
+#                     kernel_size=3,
+#                     stride=1,
+#                     padding=(2 * i + 1) // 2,
+#                     bias=True,
+#                     dilation=(2 * i + 1) // 2)
+#             )
+
+#     def forward(self, x):
+#         outs = torch.split(x, x.shape[1] // 4, dim=1)
+#         out_list = []
+#         for (i, out) in enumerate(outs):
+#             out = self.multiscale_conv[i](out)
+#             out = self.channel_attention(out) * out
+#             out_list.append(out)
+#         out = torch.cat(out_list, dim=1)
+#         out = self.spatial_attention(out) * out
+#         return out
+
+def global_median_pooling(x):  #对输入特征图进行全局中值池化操作。
+
+    median_pooled = torch.median(x.view(x.size(0), x.size(1), -1), dim=2)[0]
+    median_pooled = median_pooled.view(x.size(0), x.size(1), 1, 1)
+    return median_pooled #全局中值池化后的特征图，尺寸为 (batch_size, channels, 1, 1)
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, input_channels, internal_neurons):
+        super(ChannelAttention, self).__init__()
+        # 定义两个 1x1 卷积层，用于减少和恢复特征维度
+        self.fc1 = nn.Conv2d(in_channels=input_channels, out_channels=internal_neurons, kernel_size=1, stride=1,
+                             bias=True)
+        self.fc2 = nn.Conv2d(in_channels=internal_neurons, out_channels=input_channels, kernel_size=1, stride=1,
+                             bias=True)
+        self.input_channels = input_channels
+
+    def forward(self, inputs):
+        avg_pool = F.adaptive_avg_pool2d(inputs, output_size=(1, 1)) # 全局平均池化
+        max_pool = F.adaptive_max_pool2d(inputs, output_size=(1, 1))# 全局最大池化
+        median_pool = global_median_pooling(inputs)# 全局中值池化
+
+        # 处理全局平均池化后的输出
+        avg_out = self.fc1(avg_pool)# 通过第一个 1x1 卷积层减少特征维度
+        avg_out = F.relu(avg_out, inplace=True) # 应用 ReLU 激活函数
+        avg_out = self.fc2(avg_out)# 通过第二个 1x1 卷积层恢复特征维度
+        avg_out = torch.sigmoid(avg_out) # 使用 Sigmoid 激活函数，将输出值压缩到 [0, 1] 范围内
+
+        # 处理全局最大池化后的输出
+        max_out = self.fc1(max_pool)# 通过第一个 1x1 卷积层减少特征维度
+        max_out = F.relu(max_out, inplace=True) # 应用 ReLU 激活函数
+        max_out = self.fc2(max_out) # 通过第二个 1x1 卷积层恢复特征维度
+        max_out = torch.sigmoid(max_out) # 使用 Sigmoid 激活函数，将输出值压缩到 [0, 1] 范围内
+
+        # 处理全局中值池化后的输出
+        median_out = self.fc1(median_pool) # 通过第一个 1x1 卷积层减少特征维度
+        median_out = F.relu(median_out, inplace=True) # 应用 ReLU 激活函数
+        median_out = self.fc2(median_out) # 通过第二个 1x1 卷积层恢复特征维度
+        median_out = torch.sigmoid(median_out) # 使用 Sigmoid 激活函数，将输出值压缩到 [0, 1] 范围内
+
+        # 将三个池化结果的注意力图进行元素级相加
+        out = avg_out + max_out + median_out
         return out
+
+
+class MECS(nn.Module):
+    def __init__(self, in_channels, out_channels, channel_attention_reduce=4):
+        super(MECS , self).__init__()
+
+        self.C = in_channels
+        self.O = out_channels
+        # 确保输入和输出通道数相同
+        assert in_channels == out_channels, "Input and output channels must be the same"
+        # 初始化通道注意力模块
+        self.channel_attention = ChannelAttention(input_channels=in_channels,
+                                                  internal_neurons=in_channels // channel_attention_reduce)
+
+        # 定义 5x5 深度卷积层
+        self.initial_depth_conv = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2, groups=in_channels)
+
+        # 定义多个不同尺寸的深度卷积层
+        self.depth_convs = nn.ModuleList([
+
+            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 7), padding=(0, 3), groups=in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(7, 1), padding=(3, 0), groups=in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 11), padding=(0, 5), groups=in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(11, 1), padding=(5, 0), groups=in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(1, 21), padding=(0, 10), groups=in_channels),
+            nn.Conv2d(in_channels, in_channels, kernel_size=(21, 1), padding=(10, 0), groups=in_channels),
+        ])
+        # 定义 1x1 卷积层和激活函数
+        self.pointwise_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1, padding=0)
+        self.act = nn.GELU()
+
+    def forward(self, inputs):
+        # 全局感知机
+        inputs = self.pointwise_conv(inputs)
+        inputs = self.act(inputs)
+
+        # 通道注意力
+        channel_att_vec = self.channel_attention(inputs)
+        inputs = channel_att_vec * inputs
+
+        # 先经过 5x5 深度卷积层
+        initial_out = self.initial_depth_conv(inputs)
+
+        # 空间注意力
+        spatial_outs = [conv(initial_out) for conv in self.depth_convs]
+        spatial_out = sum(spatial_outs)
+
+        # 应用空间注意力
+        spatial_att = self.pointwise_conv(spatial_out)
+        out = spatial_att * inputs
+        out = self.pointwise_conv(out)
+        return out
+
 
 class CnnEncoderLayer(BaseModule):
 
@@ -611,7 +708,8 @@ class CnnEncoderLayer(BaseModule):
                                           ffn_drop=ffn_drop)
 
         self.norm = nn.BatchNorm2d(output_channels)
-        self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
+        # self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
+        self.mecs_block = MECS (in_channels=output_channels, out_channels=output_channels, channel_attention_reduce=8)
 
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
@@ -625,16 +723,16 @@ class CnnEncoderLayer(BaseModule):
         ])
 
     def forward(self, x):
-
+        # self.embed_dims => 3, 32, 64, 160   # self.output_channels => 32, 64, 160, 192
         # 第一次 x[16, 3, 256, 256] -> out1[16, 32, 64, 64] -> out2[16, 32, 64, 64]
         # 第二次 x[16, 32, 64, 64] -> out1[16, 64, 32, 32] -> out2[16, 64, 32, 32]
         # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
-
         out = self.layers(x)
 
-        
-        out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] [16, 64, 32, 32] [16, 160, 16, 16] [16, 192, 8, 8]
+    
+        # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
+        out = self.mecs_block(out) 
 
         _, _, H, W=out.shape
 

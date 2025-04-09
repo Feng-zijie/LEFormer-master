@@ -521,65 +521,73 @@ class ChannelAttentionModule(BaseModule):
         out = avg_out + max_out
         return self.sigmoid(out)
 
+class GGCA(nn.Module):  # (Global Grouped Coordinate Attention) 全局分组坐标注意力
+    def __init__(self, channel, h, w, reduction=16, num_groups=4):
+        super(GGCA, self).__init__()
+        self.num_groups = num_groups  # 分组数
+        assert channel % num_groups == 0, "The number of channels must be divisible by the number of groups."
+        self.group_channels = channel // num_groups  # 每组的通道数
+        self.h = h  # 高度方向的特定尺寸
+        self.w = w  # 宽度方向的特定尺寸
 
-class SpatialAttentionModule(BaseModule):
-    """An implementation of one Spatial Attention Module of LEFormer.
+        # 确保降维后的通道数至少为 1
+        reduced_channels = max(self.group_channels // reduction, 1)
 
-        Args:
-            kernel_size (int): The kernel size of Conv2d. Default: 3.
-    """
+        # 定义H方向的全局平均池化和最大池化
+        self.avg_pool_h = nn.AdaptiveAvgPool2d((h, 1))  # 输出大小为(h, 1)
+        self.max_pool_h = nn.AdaptiveMaxPool2d((h, 1))
+        # 定义W方向的全局平均池化和最大池化
+        self.avg_pool_w = nn.AdaptiveAvgPool2d((1, w))  # 输出大小为(1, w)
+        self.max_pool_w = nn.AdaptiveMaxPool2d((1, w))
 
-    def __init__(self, kernel_size=3):
-        super(SpatialAttentionModule, self).__init__()
-
-        padding = 3 if kernel_size == 7 else 1
-
-        self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-
-class MultiscaleCBAMLayer(BaseModule):
-    """An implementation of Multiscale CBAM layer of LEFormer.
-
-        Args:
-            embed_dims (int): The feature dimension.
-            kernel_size (int): The kernel size of Conv2d. Default: 7.
-        """
-
-    def __init__(self, embed_dims, kernel_size=7):
-        super(MultiscaleCBAMLayer, self).__init__()
-        self.channel_attention = ChannelAttentionModule(embed_dims // 4)
-        self.spatial_attention = SpatialAttentionModule(kernel_size)
-        self.multiscale_conv = nn.ModuleList()
-        for i in range(1, 5):
-            self.multiscale_conv.append(
-                Conv2d(
-                    in_channels=embed_dims // 4,
-                    out_channels=embed_dims // 4,
-                    kernel_size=3,
-                    stride=1,
-                    padding=(2 * i + 1) // 2,
-                    bias=True,
-                    dilation=(2 * i + 1) // 2)
-            )
+        # 定义共享的卷积层，用于通道间的降维和恢复
+        self.shared_conv = nn.Sequential(
+            nn.Conv2d(in_channels=self.group_channels, out_channels=reduced_channels, kernel_size=(1, 1)),
+            nn.BatchNorm2d(reduced_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=reduced_channels, out_channels=self.group_channels, kernel_size=(1, 1))
+        )
+        # 定义sigmoid激活函数
+        self.sigmoid_h = nn.Sigmoid()
+        self.sigmoid_w = nn.Sigmoid()
 
     def forward(self, x):
-        outs = torch.split(x, x.shape[1] // 4, dim=1)
-        out_list = []
-        for (i, out) in enumerate(outs):
-            out = self.multiscale_conv[i](out)
-            out = self.channel_attention(out) * out
-            out_list.append(out)
-        out = torch.cat(out_list, dim=1)
-        out = self.spatial_attention(out) * out
+        batch_size, channel, height, width = x.size()
+        # 确保通道数可以被分组数整除
+        assert channel % self.num_groups == 0, "The number of channels must be divisible by the number of groups."
+
+        # 将输入特征图按通道数分组
+        x = x.view(batch_size, self.num_groups, self.group_channels, height, width)
+
+        # 分别在H方向进行全局平均池化和最大池化
+        x_h_avg = self.avg_pool_h(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
+            batch_size, self.num_groups, self.group_channels, self.h, 1)
+        x_h_max = self.max_pool_h(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
+            batch_size, self.num_groups, self.group_channels, self.h, 1)
+
+        # 分别在W方向进行全局平均池化和最大池化
+        x_w_avg = self.avg_pool_w(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
+            batch_size, self.num_groups, self.group_channels, 1, self.w)
+        x_w_max = self.max_pool_w(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
+            batch_size, self.num_groups, self.group_channels, 1, self.w)
+
+        # 应用共享卷积层进行特征处理
+        y_h_avg = self.shared_conv(x_h_avg.view(batch_size * self.num_groups, self.group_channels, self.h, 1))
+        y_h_max = self.shared_conv(x_h_max.view(batch_size * self.num_groups, self.group_channels, self.h, 1))
+
+        y_w_avg = self.shared_conv(x_w_avg.view(batch_size * self.num_groups, self.group_channels, 1, self.w))
+        y_w_max = self.shared_conv(x_w_max.view(batch_size * self.num_groups, self.group_channels, 1, self.w))
+
+        # 计算注意力权重
+        att_h = self.sigmoid_h(y_h_avg + y_h_max).view(batch_size, self.num_groups, self.group_channels, self.h, 1)
+        att_w = self.sigmoid_w(y_w_avg + y_w_max).view(batch_size, self.num_groups, self.group_channels, 1, self.w)
+
+        # 应用注意力权重
+        out = x * att_h * att_w
+        out = out.view(batch_size, channel, height, width)
+
         return out
+
 
 class CnnEncoderLayer(BaseModule):
 
@@ -592,7 +600,9 @@ class CnnEncoderLayer(BaseModule):
                  padding=0,
                  act_cfg=dict(type='GELU'),
                  ffn_drop=0.,
-                 init_cfg=None):
+                 ggca_shape=None,
+                 init_cfg=None,
+                 ):
         super(CnnEncoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -611,7 +621,13 @@ class CnnEncoderLayer(BaseModule):
                                           ffn_drop=ffn_drop)
 
         self.norm = nn.BatchNorm2d(output_channels)
-        self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
+
+        # 使用 ggca_shape 参数初始化 GGCA 模块
+        if ggca_shape is not None:
+            h, w = ggca_shape
+            self.ggca_block = GGCA(output_channels, h, w)
+        else:
+            self.ggca_block = None
 
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
@@ -625,16 +641,15 @@ class CnnEncoderLayer(BaseModule):
         ])
 
     def forward(self, x):
-
+        # self.embed_dims => 3, 32, 64, 160   # self.output_channels => 32, 64, 160, 192
         # 第一次 x[16, 3, 256, 256] -> out1[16, 32, 64, 64] -> out2[16, 32, 64, 64]
         # 第二次 x[16, 32, 64, 64] -> out1[16, 64, 32, 32] -> out2[16, 64, 32, 32]
         # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
-
         out = self.layers(x)
 
-        
-        out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] [16, 64, 32, 32] [16, 160, 16, 16] [16, 192, 8, 8]
+
+        out = self.ggca_block(out) # 经过后 [16, 32, 64, 64] [16, 64, 32, 32] [16, 160, 16, 16] [16, 192, 8, 8]
 
         _, _, H, W=out.shape
 
@@ -925,6 +940,13 @@ class LEFormer(BaseModule):
 
         self.cnn_encoder_layers = nn.ModuleList()
 
+        GGCA_shape=[
+            (64,64),
+            (32,32),
+            (16,16),
+            (8,8)
+        ]
+
         for i in range(num_stages):
             self.cnn_encoder_layers.append(
                 CnnEncoderLayer(
@@ -934,7 +956,8 @@ class LEFormer(BaseModule):
                     kernel_size=patch_sizes[i],
                     stride=strides[i],
                     padding=patch_sizes[i] // 2,
-                    ffn_drop=drop_rate
+                    ffn_drop=drop_rate,
+                    ggca_shape=GGCA_shape[i], 
                 )
             )
 
@@ -955,14 +978,6 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
-            # return self.cross_encoder_fusion(
-            #     x,
-            #     cnn_encoder_layers=self.cnn_encoder_layers,
-            #     transformer_encoder_layers=self.transformer_encoder_layers,
-            #     fusion_conv_layers=self.fusion_conv_layers,
-            #     out_indices=self.out_indices
-            # )
-
              return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,

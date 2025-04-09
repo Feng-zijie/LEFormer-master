@@ -494,149 +494,147 @@ class TransformerEncoderLayer(BaseModule):
             x = _inner_forward(x)
         return x
 
+class tongdao(nn.Module):  #处理通道部分   函数名就是拼音名称
+    # 通道模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 自适应平均池化，输出大小为1x1
+        self.fc = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于降维
+        self.relu = nn.ReLU(inplace=False)  # ReLU激活函数，就地操作以节省内存
 
-class ChannelAttentionModule(BaseModule):
-    """An implementation of one Channel Attention Module of LEFormer.
+    # 前向传播函数
+    def forward(self, x):
+        b, c, _, _ = x.size()  # 提取批次大小和通道数
+        y = self.avg_pool(x)  # 应用自适应平均池化
+        y = self.fc(y)  # 应用1x1卷积
+        y = self.relu(y)  # 应用ReLU激活
+        y = nn.functional.interpolate(y, size=(x.size(2), x.size(3)), mode='nearest')  # 调整y的大小以匹配x的空间维度
+        return x * y.expand_as(x)  # 将计算得到的通道权重应用到输入x上，实现特征重校准
 
-        Args:
-            embed_dims (int): The embedding dimension.
-    """
+class kongjian(nn.Module):
+    # 空间模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.Conv1x1 = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于产生空间激励
+        self.norm = nn.Sigmoid()  # Sigmoid函数用于归一化
 
-    def __init__(self, embed_dims):
-        super(ChannelAttentionModule, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+    # 前向传播函数
+    def forward(self, x):
+        y = self.Conv1x1(x)  # 应用1x1卷积
+        y = self.norm(y)  # 应用Sigmoid函数
+        return x * y  # 将空间权重应用到输入x上，实现空间激励
 
-        self.shared_MLP = nn.Sequential(
-            Conv2d(embed_dims, embed_dims // 4, 1, bias=False),
-            nn.ReLU(),
-            Conv2d(embed_dims // 4, embed_dims, 1, bias=False)
+class hebing(nn.Module):    #函数名为合并, 意思是把空间和通道分别提取的特征合并起来
+    # 合并模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.tongdao = tongdao(in_channel)  # 创建通道子模块
+        self.kongjian = kongjian(in_channel)  # 创建空间子模块
+
+    # 前向传播函数
+    def forward(self, U):
+        U_kongjian = self.kongjian(U)  # 通过空间模块处理输入U
+        U_tongdao = self.tongdao(U)  # 通过通道模块处理输入U
+        return torch.max(U_tongdao, U_kongjian)  # 取两者的逐元素最大值，结合通道和空间激励
+
+
+# 修改所有 ReLU 的 inplace 参数为 False
+class MDFA(nn.Module):  # 多尺度空洞融合注意力模块
+    def __init__(self, dim_in, dim_out, rate=1, bn_mom=0.1):
+        super(MDFA, self).__init__()
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 1, 1, padding=0, dilation=rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
         )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=6 * rate, dilation=6 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=12 * rate, dilation=12 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch4 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=18 * rate, dilation=18 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch5_conv = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=True)
+        self.branch5_bn = nn.BatchNorm2d(dim_out, momentum=bn_mom)
+        self.branch5_relu = nn.ReLU(inplace=False)  
 
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.shared_MLP(self.avg_pool(x))
-        max_out = self.shared_MLP(self.max_pool(x))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-
-class SpatialAttentionModule(BaseModule):
-    """An implementation of one Spatial Attention Module of LEFormer.
-
-        Args:
-            kernel_size (int): The kernel size of Conv2d. Default: 3.
-    """
-
-    def __init__(self, kernel_size=3):
-        super(SpatialAttentionModule, self).__init__()
-
-        padding = 3 if kernel_size == 7 else 1
-
-        self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-
-class MultiscaleCBAMLayer(BaseModule):
-    """An implementation of Multiscale CBAM layer of LEFormer.
-
-        Args:
-            embed_dims (int): The feature dimension.
-            kernel_size (int): The kernel size of Conv2d. Default: 7.
-        """
-
-    def __init__(self, embed_dims, kernel_size=7):
-        super(MultiscaleCBAMLayer, self).__init__()
-        self.channel_attention = ChannelAttentionModule(embed_dims // 4)
-        self.spatial_attention = SpatialAttentionModule(kernel_size)
-        self.multiscale_conv = nn.ModuleList()
-        for i in range(1, 5):
-            self.multiscale_conv.append(
-                Conv2d(
-                    in_channels=embed_dims // 4,
-                    out_channels=embed_dims // 4,
-                    kernel_size=3,
-                    stride=1,
-                    padding=(2 * i + 1) // 2,
-                    bias=True,
-                    dilation=(2 * i + 1) // 2)
-            )
+        self.conv_cat = nn.Sequential(
+            nn.Conv2d(dim_out * 5, dim_out, 1, 1, padding=0, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False),
+        )
+        self.Hebing = hebing(in_channel=dim_out * 5)
 
     def forward(self, x):
-        outs = torch.split(x, x.shape[1] // 4, dim=1)
-        out_list = []
-        for (i, out) in enumerate(outs):
-            out = self.multiscale_conv[i](out)
-            out = self.channel_attention(out) * out
-            out_list.append(out)
-        out = torch.cat(out_list, dim=1)
-        out = self.spatial_attention(out) * out
-        return out
+        [b, c, row, col] = x.size()
+        conv1x1 = self.branch1(x)
+        conv3x3_1 = self.branch2(x)
+        conv3x3_2 = self.branch3(x)
+        conv3x3_3 = self.branch4(x)
+        global_feature = torch.mean(x, 2, True)
+        global_feature = torch.mean(global_feature, 3, True)
+        global_feature = self.branch5_conv(global_feature)
+        global_feature = self.branch5_bn(global_feature)
+        global_feature = self.branch5_relu(global_feature)
+        global_feature = F.interpolate(global_feature, (row, col), None, 'bilinear', True)
+        feature_cat = torch.cat([conv1x1, conv3x3_1, conv3x3_2, conv3x3_3, global_feature], dim=1)
+        larry = self.Hebing(feature_cat)
+        larry_feature_cat = larry * feature_cat
+        result = self.conv_cat(larry_feature_cat)
+        return result
 
+# 修改 CnnEncoderLayer 中的 ReLU
 class CnnEncoderLayer(BaseModule):
-
-    def __init__(self,
-                 embed_dims,
-                 feedforward_channels,
-                 output_channels,
-                 kernel_size=3,
-                 stride=2,
-                 padding=0,
-                 act_cfg=dict(type='GELU'),
-                 ffn_drop=0.,
-                 init_cfg=None):
+    def __init__(self, embed_dims, feedforward_channels, output_channels, kernel_size=3, stride=2, padding=0, act_cfg=dict(type='GELU'), ffn_drop=0., init_cfg=None):
         super(CnnEncoderLayer, self).__init__(init_cfg)
-
         self.embed_dims = embed_dims
         self.feedforward_channels = feedforward_channels
         self.output_channels = output_channels
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
-
-        self.layers = DepthWiseConvModule(embed_dims=embed_dims,
-                                          feedforward_channels=feedforward_channels // 2,
-                                          output_channels=output_channels,
-                                          kernel_size=kernel_size,
-                                          stride=stride,
-                                          padding=padding,
-                                          act_cfg=dict(type='GELU'),
-                                          ffn_drop=ffn_drop)
-
+        self.layers = DepthWiseConvModule(
+            embed_dims=embed_dims,
+            feedforward_channels=feedforward_channels // 2,
+            output_channels=output_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            act_cfg=dict(type='GELU'),
+            ffn_drop=ffn_drop
+        )
         self.norm = nn.BatchNorm2d(output_channels)
-        self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
-
+        self.mdfa_block = MDFA(dim_in=output_channels, dim_out=output_channels)
         self.residual = nn.ModuleList([
-            # 将 bias = False 改变为 bias = True
-            nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),  # 普通残差  
-            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),  # 下采样残差
-            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),  # 下采样残差
-            nn.Sequential(  # 带 BN 的残差
+            nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),
+            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.Sequential(
                 nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
                 nn.BatchNorm2d(output_channels)
             )
         ])
 
     def forward(self, x):
-
+        # self.embed_dims => 3, 32, 64, 160   # self.output_channels => 32, 64, 160, 192
         # 第一次 x[16, 3, 256, 256] -> out1[16, 32, 64, 64] -> out2[16, 32, 64, 64]
         # 第二次 x[16, 32, 64, 64] -> out1[16, 64, 32, 32] -> out2[16, 64, 32, 32]
         # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
-
         out = self.layers(x)
 
-        
-        out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] [16, 64, 32, 32] [16, 160, 16, 16] [16, 192, 8, 8]
 
-        _, _, H, W=out.shape
+        # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
+        out = self.mdfa_block(out)
+
+        _, _, H, W = out.shape
 
         if H == 64:
             identity = self.residual[0](x)
@@ -646,13 +644,13 @@ class CnnEncoderLayer(BaseModule):
             identity = self.residual[2](x)
         else:
             identity = self.residual[3](x)
-
         if identity.shape != out.shape:
-            print(f"mismatch: identity={identity.shape}, out={out.shape}")
             identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
 
-        out += identity
+        out = out + identity  # 确保这里不是就地操作
+
         return out
+    
 
 # 原始的
 """

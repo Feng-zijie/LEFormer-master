@@ -100,16 +100,54 @@ class MECS(nn.Module):
         return out
 
 
+# if __name__ == '__main__':
+#     # 假设输入数据
+#     batch_size = 4
+#     channels = 16
+#     height = 64
+#     width = 64
+#     input_tensor = torch.randn(batch_size, channels, height, width).cuda()
+
+#     # 初始化 MECS 块
+#     cpca_block = MECS (in_channels=16, out_channels=16, channel_attention_reduce=4).cuda()
+
+#     # 通过 MECS 块处理输入
+#     output_tensor = cpca_block(input_tensor)
+
+#     # 打印输出张量的形状
+#     print(f"Output shape: {output_tensor.shape}")
+
+
+
+
+# if __name__ == '__main__':
+#     # 假设输入数据
+#     batch_size = 16
+#     channels = 3
+#     height = 256
+#     width = 256
+#     input_tensor = torch.randn(batch_size, channels, height, width).cuda()
+
+#     # 初始化 MECS 块
+#     cpca_block = MECS (in_channels=3, out_channels=3, channel_attention_reduce=1).cuda()
+
+#     # 通过 MECS 块处理输入
+#     output_tensor = cpca_block(input_tensor)
+
+#     # 打印输出张量的形状
+#     print(f"Output shape: {output_tensor.shape}")
+
+
 if __name__ == '__main__':
     # 假设输入数据
-    batch_size = 4
-    channels = 16
-    height = 64
-    width = 64
-    input_tensor = torch.randn(batch_size, channels, height, width).cuda()
+    batch_size = 16
+    channels = 192
+    height = 8
+    width = 8
+    input_tensor = torch.randn(batch_size, channels, height, width)
 
     # 初始化 MECS 块
-    cpca_block = MECS (in_channels=16, out_channels=16, channel_attention_reduce=4).cuda()
+    cpca_block = MECS (in_channels=channels, out_channels=channels, channel_attention_reduce=8)
 
     # 通过 MECS 块处理输入
     output_tensor = cpca_block(input_tensor)

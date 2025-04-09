@@ -495,91 +495,58 @@ class TransformerEncoderLayer(BaseModule):
         return x
 
 
-class ChannelAttentionModule(BaseModule):
-    """An implementation of one Channel Attention Module of LEFormer.
+# 定义GAM_Attention类
+class GCSA(nn.Module):
+    def __init__(self, in_channels, rate=4):
+        super(GCSA, self).__init__()
 
-        Args:
-            embed_dims (int): The embedding dimension.
-    """
-
-    def __init__(self, embed_dims):
-        super(ChannelAttentionModule, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        self.shared_MLP = nn.Sequential(
-            Conv2d(embed_dims, embed_dims // 4, 1, bias=False),
-            nn.ReLU(),
-            Conv2d(embed_dims // 4, embed_dims, 1, bias=False)
+        # 通道注意力子模块
+        self.channel_attention = nn.Sequential(
+            nn.Linear(in_channels, int(in_channels / rate)),  # 线性层，将通道数缩减到1/rate
+            nn.ReLU(inplace=True),  # ReLU激活函数
+            nn.Linear(int(in_channels / rate), in_channels)  # 线性层，将通道数恢复到原始大小
         )
 
-        self.sigmoid = nn.Sigmoid()
+        # 空间注意力子模块
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(in_channels, int(in_channels / rate), kernel_size=7, padding=3),  # 7x7卷积，通道数缩减到1/rate
+            nn.BatchNorm2d(int(in_channels / rate)),  # 批归一化
+            nn.ReLU(inplace=True),  # ReLU激活函数
+            nn.Conv2d(int(in_channels / rate), in_channels, kernel_size=7, padding=3),  # 7x7卷积，恢复到原始通道数
+            nn.BatchNorm2d(in_channels)  # 批归一化
+        )
 
+    # 通道洗牌操作函数
+    def channel_shuffle(self, x, groups):
+        batchsize, num_channels, height, width = x.size()
+        channels_per_group = num_channels // groups
+        # 调整形状，分组
+        x = x.view(batchsize, groups, channels_per_group, height, width)
+        # 转置，打乱组内通道
+        x = torch.transpose(x, 1, 2).contiguous()
+        # 恢复原始形状
+        x = x.view(batchsize, -1, height, width)
+
+        return x
+
+    # 前向传播函数
     def forward(self, x):
-        avg_out = self.shared_MLP(self.avg_pool(x))
-        max_out = self.shared_MLP(self.max_pool(x))
-        out = avg_out + max_out
-        return self.sigmoid(out)
+        b, c, h, w = x.shape  # 获取输入张量的形状
+        x_permute = x.permute(0, 2, 3, 1).view(b, -1, c)  # 调整形状，便于通道注意力操作
+        x_att_permute = self.channel_attention(x_permute).view(b, h, w, c)  # 应用通道注意力
+        x_channel_att = x_att_permute.permute(0, 3, 1, 2).sigmoid()  # 调整回原始形状，并应用Sigmoid激活函数
+
+        x = x * x_channel_att  # 将输入特征图与通道注意力图逐元素相乘
+
+        x = self.channel_shuffle(x, groups=4) # 添加通道洗牌操作[根据自己的任务设定组数,2也行,大于4也行，看效果选择]
+
+        x_spatial_att = self.spatial_attention(x).sigmoid()  # 应用空间注意力，并应用Sigmoid激活函数
+
+        out = x * x_spatial_att  # 将输入特征图与空间注意力图逐元素相乘
+
+        return out  # 返回输出特征图
 
 
-class SpatialAttentionModule(BaseModule):
-    """An implementation of one Spatial Attention Module of LEFormer.
-
-        Args:
-            kernel_size (int): The kernel size of Conv2d. Default: 3.
-    """
-
-    def __init__(self, kernel_size=3):
-        super(SpatialAttentionModule, self).__init__()
-
-        padding = 3 if kernel_size == 7 else 1
-
-        self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-
-class MultiscaleCBAMLayer(BaseModule):
-    """An implementation of Multiscale CBAM layer of LEFormer.
-
-        Args:
-            embed_dims (int): The feature dimension.
-            kernel_size (int): The kernel size of Conv2d. Default: 7.
-        """
-
-    def __init__(self, embed_dims, kernel_size=7):
-        super(MultiscaleCBAMLayer, self).__init__()
-        self.channel_attention = ChannelAttentionModule(embed_dims // 4)
-        self.spatial_attention = SpatialAttentionModule(kernel_size)
-        self.multiscale_conv = nn.ModuleList()
-        for i in range(1, 5):
-            self.multiscale_conv.append(
-                Conv2d(
-                    in_channels=embed_dims // 4,
-                    out_channels=embed_dims // 4,
-                    kernel_size=3,
-                    stride=1,
-                    padding=(2 * i + 1) // 2,
-                    bias=True,
-                    dilation=(2 * i + 1) // 2)
-            )
-
-    def forward(self, x):
-        outs = torch.split(x, x.shape[1] // 4, dim=1)
-        out_list = []
-        for (i, out) in enumerate(outs):
-            out = self.multiscale_conv[i](out)
-            out = self.channel_attention(out) * out
-            out_list.append(out)
-        out = torch.cat(out_list, dim=1)
-        out = self.spatial_attention(out) * out
-        return out
 
 class CnnEncoderLayer(BaseModule):
 
@@ -611,7 +578,7 @@ class CnnEncoderLayer(BaseModule):
                                           ffn_drop=ffn_drop)
 
         self.norm = nn.BatchNorm2d(output_channels)
-        self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
+        self.gcsa_block = GCSA(in_channels=output_channels)
 
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
@@ -625,16 +592,15 @@ class CnnEncoderLayer(BaseModule):
         ])
 
     def forward(self, x):
-
+        # self.embed_dims => 3, 32, 64, 160   # self.output_channels => 32, 64, 160, 192
         # 第一次 x[16, 3, 256, 256] -> out1[16, 32, 64, 64] -> out2[16, 32, 64, 64]
         # 第二次 x[16, 32, 64, 64] -> out1[16, 64, 32, 32] -> out2[16, 64, 32, 32]
         # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
-
         out = self.layers(x)
 
-        
-        out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] [16, 64, 32, 32] [16, 160, 16, 16] [16, 192, 8, 8]
+
+        out = self.gcsa_block(out) # 经过后 [16, 32, 64, 64] [16, 64, 32, 32] [16, 160, 16, 16] [16, 192, 8, 8]
 
         _, _, H, W=out.shape
 
@@ -653,42 +619,6 @@ class CnnEncoderLayer(BaseModule):
 
         out += identity
         return out
-
-# 原始的
-"""
-class CrossEncoderFusion(nn.Module):
-    def __init__(self):
-        super(CrossEncoderFusion, self).__init__()
-
-    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, fusion_conv_layers, out_indices):
-        outs = []
-        cnn_encoder_out = x
-
-        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(
-                zip(cnn_encoder_layers, transformer_encoder_layers)):
-            
-            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out) # [16, 3, 256, 256] → [16, 32, 128, 128] → [16, 64, 64, 64] → [16, 128, 32, 32] → [16, 256, 16, 16]
-            
-            x, hw_shape = transformer_encoder_layer[0](x)
-            for block in transformer_encoder_layer[1]:
-                x = block(x, hw_shape)
-
-            
-            # 过了block后的x的shape
-            # torch.Size([16, 4096, 32])   torch.Size([16, 1024, 64])  torch.Size([16, 256, 160])  torch.Size([16, 64, 192])
-
-            x = transformer_encoder_layer[2](x)
-            x = nlc_to_nchw(x, hw_shape)
-
-            x = torch.cat((x, cnn_encoder_out), dim=1)
-            
-            x = fusion_conv_layers[i](x)
-
-            if i in out_indices:
-                outs.append(x)
-        return outs
-
-"""
 
 # cross 变体
 class DenseLayer(nn.Module):
@@ -955,14 +885,6 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
-            # return self.cross_encoder_fusion(
-            #     x,
-            #     cnn_encoder_layers=self.cnn_encoder_layers,
-            #     transformer_encoder_layers=self.transformer_encoder_layers,
-            #     fusion_conv_layers=self.fusion_conv_layers,
-            #     out_indices=self.out_indices
-            # )
-
              return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,

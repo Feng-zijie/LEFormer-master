@@ -160,7 +160,7 @@ workflow = [('train', 1)]
 cudnn_benchmark = True
 optimizer = dict(
     type='AdamW',
-    lr=0.00015,
+    lr=0.0005,
     betas=(0.9, 0.999),
     weight_decay=0.05,
     paramwise_cfg=dict(
@@ -180,6 +180,6 @@ lr_config = dict(
 runner = dict(type='IterBasedRunner', max_iters=160000)
 checkpoint_config = dict(by_epoch=False, interval=16000)
 evaluation = dict(interval=16000, metric='mIoU', pre_eval=True)
-work_dir = './work_dirs_qtpl/01_DenseNet_layer*3_lr_0.00015+weight_decay_0.05'
-gpu_ids = [2]
+work_dir = './work_dirs_qtpl/3_DenseNet_layer*3_lr_0.0005+weight_decay_0.05'
+gpu_ids = [3]
 auto_resume = False
