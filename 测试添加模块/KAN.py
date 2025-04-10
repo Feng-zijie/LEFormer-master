@@ -376,7 +376,7 @@ if __name__ == "__main__":
     )
 
     # 创建输入张量
-    input_tensor = torch.randn([16, 32, 64, 64])  
+    input_tensor = torch.randn([16, 64, 32, 32])  
 
     # 前向传播
     output_tensor = model(input_tensor)
