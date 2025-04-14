@@ -105,10 +105,22 @@ class MDFA(nn.Module):                       ##多尺度空洞融合注意力模
         return result
 
 
+# if __name__ == '__main__':
+#     input = torch.randn(16, 192, 8, 8)  # 随机生成输入数据
+#     model = MDFA(dim_in=192,dim_out=192)  # 实例化模块
+#     output = model(input)  # 将输入通过模块处理
+#     print(output.shape)  # 输出处理后的数据形状
+
 if __name__ == '__main__':
-    input = torch.randn(16, 192, 8, 8)  # 随机生成输入数据
-    model = MDFA(dim_in=192,dim_out=192)  # 实例化模块
-    output = model(input)  # 将输入通过模块处理
-    print(output.shape)  # 输出处理后的数据形状
+    # 定义四个阶段的 MDFA 模块
+    model_stage1 = MDFA(dim_in=3, dim_out=32)  # 第一次输入 [16, 3, 256, 256] 输出 [16, 32, 64, 64]
+    model_stage2 = MDFA(dim_in=32, dim_out=64)  # 第二次输入 [16, 32, 64, 64] 输出 [16, 64, 32, 32]
+    model_stage3 = MDFA(dim_in=64, dim_out=160)  # 第三次输入 [16, 64, 32, 32] 输出 [16, 160, 16, 16]
+    model_stage4 = MDFA(dim_in=160, dim_out=192)  # 第四次输入 [16, 160, 16, 16] 输出 [16, 192, 8, 8]
+
+    # 模拟输入数据
+    input_stage1 = torch.randn(16, 3, 256, 256)  # 输入 [16, 3, 256, 256]
+    output_stage1 = model_stage1(F.avg_pool2d(input_stage1, kernel_size=4, stride=4))  # 输出 [16, 32, 64, 64]
+    print(output_stage1.shape)  # 打印输出形状
 
 

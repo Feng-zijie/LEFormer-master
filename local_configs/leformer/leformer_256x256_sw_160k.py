@@ -16,7 +16,7 @@ optimizer = dict(
         custom_keys={
             'pos_block': dict(decay_mult=0.),
             'norm': dict(decay_mult=0.),
-            'head': dict(lr_mult=5.), # 原始的 'head': dict(lr_mult=10.)
+            'head': dict(lr_mult=2.), # 原始的 'head': dict(lr_mult=10.)
             # 'backbone': dict(lr_mult=0.5) # 后来加的
         }))
 

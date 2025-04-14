@@ -20,6 +20,65 @@ from ..builder import BACKBONES
 from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
 from torch.nn import init
 
+class DepthWiseConvModule(BaseModule):
+    """An implementation of one Depth-wise Conv Module of LEFormer.
+
+    Args:
+        embed_dims (int): The feature dimension.
+        feedforward_channels (int): The hidden dimension for FFNs.
+        output_channels (int): The output channles of each cnn encoder layer.
+        kernel_size (int): The kernel size of Conv2d. Default: 3.
+        stride (int): The stride of Conv2d. Default: 2.
+        padding (int): The padding of Conv2d. Default: 1.
+        act_cfg (dict): The activation config for FFNs.
+            Default: dict(type='GELU').
+        ffn_drop (float, optional): Probability of an element to be
+            zeroed in FFN. Default: 0.0.
+        init_cfg (dict, optional): Initialization config dict.
+            Default: None.
+    """
+
+    def __init__(self,
+                 embed_dims,
+                 feedforward_channels,
+                 output_channels,
+                 kernel_size=3,
+                 stride=2,
+                 padding=1,
+                 act_cfg=dict(type='GELU'),
+                 ffn_drop=0.,
+                 init_cfg=None):
+        super(DepthWiseConvModule, self).__init__(init_cfg)
+        self.activate = build_activation_layer(act_cfg)
+        fc1 = Conv2d(
+            in_channels=embed_dims,
+            out_channels=feedforward_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True)
+        pe_conv = Conv2d(
+            in_channels=feedforward_channels,
+            out_channels=feedforward_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=True,
+            groups=feedforward_channels)
+        fc2 = Conv2d(
+            in_channels=feedforward_channels,
+            out_channels=output_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True)
+        drop = nn.Dropout(ffn_drop)
+        layers = [fc1, pe_conv, self.activate, drop, fc2, drop]
+        self.layers = Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+
 # MobileNetV3
 class hswish(nn.Module):
     def forward(self, x):

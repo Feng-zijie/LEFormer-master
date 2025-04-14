@@ -18,210 +18,64 @@ from mmcv.runner import BaseModule, ModuleList, Sequential
 
 from ..builder import BACKBONES
 from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
-from torch.nn import init
-
-# MobileNetV3
-class hswish(nn.Module):
-    def forward(self, x):
-        out = x * F.relu6(x + 3, inplace=True) / 6
-        return out
 
 
-class hsigmoid(nn.Module):
-    def forward(self, x):
-        out = F.relu6(x + 3, inplace=True) / 6
-        return out
+class DepthWiseConvModule(BaseModule):
+    """An implementation of one Depth-wise Conv Module of LEFormer.
 
+    Args:
+        embed_dims (int): The feature dimension.
+        feedforward_channels (int): The hidden dimension for FFNs.
+        output_channels (int): The output channles of each cnn encoder layer.
+        kernel_size (int): The kernel size of Conv2d. Default: 3.
+        stride (int): The stride of Conv2d. Default: 2.
+        padding (int): The padding of Conv2d. Default: 1.
+        act_cfg (dict): The activation config for FFNs.
+            Default: dict(type='GELU').
+        ffn_drop (float, optional): Probability of an element to be
+            zeroed in FFN. Default: 0.0.
+        init_cfg (dict, optional): Initialization config dict.
+            Default: None.
+    """
 
-class SeModule(nn.Module):
-    def __init__(self, in_size, reduction=4):
-        super(SeModule, self).__init__()
-        expand_size =  max(in_size // reduction, 8)
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_size, expand_size, kernel_size=1, bias=False),
-            nn.BatchNorm2d(expand_size),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(expand_size, in_size, kernel_size=1, bias=False),
-            nn.Hardsigmoid()
-        )
-
-    def forward(self, x):
-        return x * self.se(x)
-
-
-class Block(nn.Module):
-    '''expand + depthwise + pointwise'''
-    def __init__(self, kernel_size, in_size, expand_size, out_size, act, se, stride):
-        super(Block, self).__init__()
-        self.stride = stride
-
-        self.conv1 = nn.Conv2d(in_size, expand_size, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(expand_size)
-        self.act1 = act(inplace=True)
-
-        self.conv2 = nn.Conv2d(expand_size, expand_size, kernel_size=kernel_size, stride=stride, padding=kernel_size//2, groups=expand_size, bias=False)
-        self.bn2 = nn.BatchNorm2d(expand_size)
-        self.act2 = act(inplace=True)
-        self.se = SeModule(expand_size) if se else nn.Identity()
-
-        self.conv3 = nn.Conv2d(expand_size, out_size, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_size)
-        self.act3 = act(inplace=True)
-
-        self.skip = None
-        if stride == 1 and in_size != out_size:
-            self.skip = nn.Sequential(
-                nn.Conv2d(in_size, out_size, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_size)
-            )
-
-        if stride == 2 and in_size != out_size:
-            self.skip = nn.Sequential(
-                nn.Conv2d(in_channels=in_size, out_channels=in_size, kernel_size=3, groups=in_size, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(in_size),
-                nn.Conv2d(in_size, out_size, kernel_size=1, bias=True),
-                nn.BatchNorm2d(out_size)
-            )
-
-        if stride == 2 and in_size == out_size:
-            self.skip = nn.Sequential(
-                nn.Conv2d(in_channels=in_size, out_channels=out_size, kernel_size=3, groups=in_size, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(out_size)
-            )
+    def __init__(self,
+                 embed_dims,
+                 feedforward_channels,
+                 output_channels,
+                 kernel_size=3,
+                 stride=2,
+                 padding=1,
+                 act_cfg=dict(type='GELU'),
+                 ffn_drop=0.,
+                 init_cfg=None):
+        super(DepthWiseConvModule, self).__init__(init_cfg)
+        self.activate = build_activation_layer(act_cfg)
+        fc1 = Conv2d(
+            in_channels=embed_dims,
+            out_channels=feedforward_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True)
+        pe_conv = Conv2d(
+            in_channels=feedforward_channels,
+            out_channels=feedforward_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=True,
+            groups=feedforward_channels)
+        fc2 = Conv2d(
+            in_channels=feedforward_channels,
+            out_channels=output_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True)
+        drop = nn.Dropout(ffn_drop)
+        layers = [fc1, pe_conv, self.activate, drop, fc2, drop]
+        self.layers = Sequential(*layers)
 
     def forward(self, x):
-        skip = x
-        out = self.act1(self.bn1(self.conv1(x)))
-        out = self.act2(self.bn2(self.conv2(out)))
-        out = self.se(out)
-        out = self.bn3(self.conv3(out))
-        
-        if self.skip is not None:
-            skip = self.skip(skip)
-        return self.act3(out + skip)
-
-
-
-class MobileNetV3_Small(nn.Module):
-    def __init__(self,embed_dims,output_channels,act=nn.Hardswish):
-        super(MobileNetV3_Small, self).__init__()
-        self.bn1 = nn.BatchNorm2d(16)
-        self.hs1 = act(inplace=True)
-
-        self.bneck1 = nn.Sequential(
-            Block(3, 16, 16, 16, nn.ReLU, True, 2),
-            Block(3, 16, 72, 24, nn.ReLU, False, 2),
-            Block(3, 24, 88, 24, nn.ReLU, False, 1),
-            Block(5, 24, 96, 32, act, True, 1),
-            Block(5, 32, 140, 32, act, True, 1)
-        )
-        self.bneck2 = nn.Sequential(
-            Block(3, 16, 16, 16, nn.ReLU, True, 2),
-            Block(3, 16, 72, 24, nn.ReLU, False, 1),
-            Block(3, 24, 88, 24, nn.ReLU, False, 1),
-            Block(5, 24, 96, 40, act, True, 1),
-            Block(5, 40, 240, 40, act, True, 1),
-            Block(5, 40, 240, 40, act, True, 1),
-            Block(5, 40, 120, 48, act, True, 1),
-            Block(5, 48, 144, 48, act, True, 1),
-            Block(5, 48, 288, 64, act, True, 1),
-            Block(5, 64, 386, 64, act, True, 1),
-        )       
-        self.bneck3 = nn.Sequential(
-            Block(3, 16, 16, 16, nn.ReLU, True, 2),
-            Block(3, 16, 72, 24, nn.ReLU, False, 1),
-            Block(3, 24, 88, 24, nn.ReLU, False, 1),
-            Block(5, 24, 96, 40, act, True, 1),
-            Block(5, 40, 240, 40, act, True, 1),
-            Block(5, 40, 240, 40, act, True, 1),
-            Block(5, 40, 120, 48, act, True, 1),
-            Block(3, 48, 200, 80, act, False, 1),
-            Block(3, 80, 184, 80, act, False, 1),
-            Block(3, 80, 184, 80, act, False, 1),
-            Block(3, 80, 480, 96, act, True, 1),
-            Block(5, 96, 576, 96, act, True, 1),
-            Block(5, 96, 576, 96, act, True, 1),
-            Block(3, 96, 672, 112, act, True, 1),
-            Block(5, 112, 672, 160, act, True, 1),
-        )     
-        self.bneck4 = nn.Sequential(
-            Block(3, 16, 16, 16, nn.ReLU, True, 2),
-            Block(3, 16, 72, 24, nn.ReLU, False, 1),
-            Block(3, 24, 88, 24, nn.ReLU, False, 1),
-            Block(5, 24, 96, 40, act, True, 1),
-            Block(5, 40, 240, 40, act, True, 1),
-            Block(5, 40, 240, 40, act, True, 1),
-            Block(5, 40, 120, 48, act, True, 1),
-            Block(3, 48, 200, 80, act, False, 1),
-            Block(3, 80, 184, 80, act, False, 1),
-            Block(3, 80, 184, 80, act, False, 1),
-            Block(3, 80, 480, 96, act, True, 1),
-            Block(5, 96, 576, 96, act, True, 1),
-            Block(5, 96, 576, 112, act, True, 1),
-            Block(3, 112, 672, 112, act, True, 1),
-            Block(5, 112, 672, 160, act, True, 1),
-            Block(5, 160, 672, 160, act, True, 1),
-            Block(5, 160, 960, 192, act, True, 1),
-        )       
-        
-        
-
-        self.conv2_1 = nn.Conv2d(embed_dims, embed_dims, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv2_2 = nn.Conv2d(embed_dims, 16, kernel_size=3, stride=1, padding=1, bias=False)
-        self.conv2_3 = nn.Conv2d(output_channels, output_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(embed_dims)
-        self.bn2 = nn.BatchNorm2d(output_channels)
-        self.hs2 = act(inplace=True)
-        self.gap = nn.AdaptiveAvgPool2d(1)
-
-        self.linear3 = nn.Linear(576, 1280, bias=False)
-        self.bn3 = nn.BatchNorm1d(1280)
-        self.hs3 = act(inplace=True)
-        self.drop = nn.Dropout(0.2)
-        self.init_params()
-
-    def init_params(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                init.constant_(m.weight, 1)
-                init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                init.normal_(m.weight, std=0.001)
-                if m.bias is not None:
-                    init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        _,c, h, w = x.size()
-        out = self.hs1(self.bn1(self.conv2_1(x)))
-        out=self.conv2_2(out)
-            
-        if c==3:
-            out = self.bneck1(out)
-
-        elif c==32:
-            out = self.bneck2(out)
-
-        elif c==64:    
-
-            out = self.bneck3(out)
-        elif c==160:        
-            out = self.bneck4(out)
-    
-        out = self.hs2(self.bn2(out))
-        out=self.bn2(self.conv2_3(out))
-        return self.drop(self.hs3(out))
-
-
-
-
-
-
-
+        return self.layers(x)
 
 
 class MixFFN(BaseModule):
@@ -640,140 +494,220 @@ class TransformerEncoderLayer(BaseModule):
             x = _inner_forward(x)
         return x
 
-class tongdao(nn.Module):  #处理通道部分   函数名就是拼音名称
-    # 通道模块初始化，输入通道数为in_channel
-    def __init__(self, in_channel):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 自适应平均池化，输出大小为1x1
-        self.fc = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于降维
-        self.relu = nn.ReLU(inplace=False)  # ReLU激活函数，就地操作以节省内存
 
-    # 前向传播函数
-    def forward(self, x):
-        b, c, _, _ = x.size()  # 提取批次大小和通道数
-        y = self.avg_pool(x)  # 应用自适应平均池化
-        y = self.fc(y)  # 应用1x1卷积
-        y = self.relu(y)  # 应用ReLU激活
-        y = nn.functional.interpolate(y, size=(x.size(2), x.size(3)), mode='nearest')  # 调整y的大小以匹配x的空间维度
-        return x * y.expand_as(x)  # 将计算得到的通道权重应用到输入x上，实现特征重校准
+class ChannelAttentionModule(BaseModule):
+    """An implementation of one Channel Attention Module of LEFormer.
 
-class kongjian(nn.Module):
-    # 空间模块初始化，输入通道数为in_channel
-    def __init__(self, in_channel):
-        super().__init__()
-        self.Conv1x1 = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于产生空间激励
-        self.norm = nn.Sigmoid()  # Sigmoid函数用于归一化
+        Args:
+            embed_dims (int): The embedding dimension.
+    """
 
-    # 前向传播函数
-    def forward(self, x):
-        y = self.Conv1x1(x)  # 应用1x1卷积
-        y = self.norm(y)  # 应用Sigmoid函数
-        return x * y  # 将空间权重应用到输入x上，实现空间激励
+    def __init__(self, embed_dims):
+        super(ChannelAttentionModule, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
 
-class hebing(nn.Module):    #函数名为合并, 意思是把空间和通道分别提取的特征合并起来
-    # 合并模块初始化，输入通道数为in_channel
-    def __init__(self, in_channel):
-        super().__init__()
-        self.tongdao = tongdao(in_channel)  # 创建通道子模块
-        self.kongjian = kongjian(in_channel)  # 创建空间子模块
-
-    # 前向传播函数
-    def forward(self, U):
-        U_kongjian = self.kongjian(U)  # 通过空间模块处理输入U
-        U_tongdao = self.tongdao(U)  # 通过通道模块处理输入U
-        return torch.max(U_tongdao, U_kongjian)  # 取两者的逐元素最大值，结合通道和空间激励
-
-
-# 修改所有 ReLU 的 inplace 参数为 False
-class MDFA(nn.Module):  # 多尺度空洞融合注意力模块
-    def __init__(self, dim_in, dim_out, rate=1, bn_mom=0.1):
-        super(MDFA, self).__init__()
-        self.branch1 = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, 1, 1, padding=0, dilation=rate, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False), 
+        self.shared_MLP = nn.Sequential(
+            Conv2d(embed_dims, embed_dims // 4, 1, bias=False),
+            nn.ReLU(),
+            Conv2d(embed_dims // 4, embed_dims, 1, bias=False)
         )
-        self.branch2 = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, 3, 1, padding=6 * rate, dilation=6 * rate, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False), 
-        )
-        self.branch3 = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, 3, 1, padding=12 * rate, dilation=12 * rate, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False), 
-        )
-        self.branch4 = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, 3, 1, padding=18 * rate, dilation=18 * rate, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False), 
-        )
-        self.branch5_conv = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=True)
-        self.branch5_bn = nn.BatchNorm2d(dim_out, momentum=bn_mom)
-        self.branch5_relu = nn.ReLU(inplace=False)  
 
-        self.conv_cat = nn.Sequential(
-            nn.Conv2d(dim_out * 5, dim_out, 1, 1, padding=0, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False),
-        )
-        self.Hebing = hebing(in_channel=dim_out * 5)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        [b, c, row, col] = x.size()
-        conv1x1 = self.branch1(x)
-        conv3x3_1 = self.branch2(x)
-        conv3x3_2 = self.branch3(x)
-        conv3x3_3 = self.branch4(x)
-        global_feature = torch.mean(x, 2, True)
-        global_feature = torch.mean(global_feature, 3, True)
-        global_feature = self.branch5_conv(global_feature)
-        global_feature = self.branch5_bn(global_feature)
-        global_feature = self.branch5_relu(global_feature)
-        global_feature = F.interpolate(global_feature, (row, col), None, 'bilinear', True)
-        feature_cat = torch.cat([conv1x1, conv3x3_1, conv3x3_2, conv3x3_3, global_feature], dim=1)
-        larry = self.Hebing(feature_cat)
-        larry_feature_cat = larry * feature_cat
-        result = self.conv_cat(larry_feature_cat)
-        return result
+        avg_out = self.shared_MLP(self.avg_pool(x))
+        max_out = self.shared_MLP(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
-# 修改 CnnEncoderLayer 中的 ReLU
+
+class SpatialAttentionModule(BaseModule):
+    """An implementation of one Spatial Attention Module of LEFormer.
+
+        Args:
+            kernel_size (int): The kernel size of Conv2d. Default: 3.
+    """
+
+    def __init__(self, kernel_size=3):
+        super(SpatialAttentionModule, self).__init__()
+
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+
+class MultiscaleCBAMLayer(BaseModule):
+    """An implementation of Multiscale CBAM layer of LEFormer.
+
+        Args:
+            embed_dims (int): The feature dimension.
+            kernel_size (int): The kernel size of Conv2d. Default: 7.
+        """
+
+    def __init__(self, embed_dims, kernel_size=7):
+        super(MultiscaleCBAMLayer, self).__init__()
+        self.channel_attention = ChannelAttentionModule(embed_dims // 4)
+        self.spatial_attention = SpatialAttentionModule(kernel_size)
+        self.multiscale_conv = nn.ModuleList()
+        for i in range(1, 5):
+            self.multiscale_conv.append(
+                Conv2d(
+                    in_channels=embed_dims // 4,
+                    out_channels=embed_dims // 4,
+                    kernel_size=3,
+                    stride=1,
+                    padding=(2 * i + 1) // 2,
+                    bias=True,
+                    dilation=(2 * i + 1) // 2)
+            )
+
+    def forward(self, x):
+        outs = torch.split(x, x.shape[1] // 4, dim=1)
+        out_list = []
+        for (i, out) in enumerate(outs):
+            out = self.multiscale_conv[i](out)
+            out = self.channel_attention(out) * out
+            out_list.append(out)
+        out = torch.cat(out_list, dim=1)
+        out = self.spatial_attention(out) * out
+        return out
+
+
+# class CnnEncoderLayer(BaseModule):
+#     """Implements one cnn encoder layer in LEFormer.
+
+#         Args:
+#             embed_dims (int): The feature dimension.
+#             feedforward_channels (int): The hidden dimension for FFNs.
+#             output_channels (int): The output channles of each cnn encoder layer.
+#             kernel_size (int): The kernel size of Conv2d. Default: 3.
+#             stride (int): The stride of Conv2d. Default: 2.
+#             padding (int): The padding of Conv2d. Default: 0.
+#             act_cfg (dict): The activation config for FFNs.
+#                 Default: dict(type='GELU').
+#             ffn_drop (float, optional): Probability of an element to be
+#                 zeroed in FFN. Default 0.0.
+#             init_cfg (dict, optional): Initialization config dict.
+#                 Default: None.
+#         """
+
+#     def __init__(self,
+#                  embed_dims,
+#                  feedforward_channels,
+#                  output_channels,
+#                  kernel_size=3,
+#                  stride=2,
+#                  padding=0,
+#                  act_cfg=dict(type='GELU'),
+#                  ffn_drop=0.,
+#                  init_cfg=None):
+#         super(CnnEncoderLayer, self).__init__(init_cfg)
+
+#         self.embed_dims = embed_dims
+#         self.feedforward_channels = feedforward_channels
+#         self.output_channels = output_channels
+#         self.act_cfg = act_cfg
+#         self.activate = build_activation_layer(act_cfg)
+
+#         self.layers = DepthWiseConvModule(embed_dims=embed_dims,
+#                                           feedforward_channels=feedforward_channels // 2,
+#                                           output_channels=output_channels,
+#                                           kernel_size=kernel_size,
+#                                           stride=stride,
+#                                           padding=padding,
+#                                           act_cfg=dict(type='GELU'),
+#                                           ffn_drop=ffn_drop)
+
+#         self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
+
+#     def forward(self, x):
+#         out = self.layers(x)
+#         out = self.multiscale_cbam(out)
+#         return out
+
 class CnnEncoderLayer(BaseModule):
-    def __init__(self, embed_dims, feedforward_channels, output_channels, kernel_size=3, stride=2, padding=0, act_cfg=dict(type='GELU'), ffn_drop=0., init_cfg=None):
+    """Implements one cnn encoder layer in LEFormer.
+
+        Args:
+            embed_dims (int): The feature dimension.
+            feedforward_channels (int): The hidden dimension for FFNs.
+            output_channels (int): The output channles of each cnn encoder layer.
+            kernel_size (int): The kernel size of Conv2d. Default: 3.
+            stride (int): The stride of Conv2d. Default: 2.
+            padding (int): The padding of Conv2d. Default: 0.
+            act_cfg (dict): The activation config for FFNs.
+                Default: dict(type='GELU').
+            ffn_drop (float, optional): Probability of an element to be
+                zeroed in FFN. Default 0.0.
+            init_cfg (dict, optional): Initialization config dict.
+                Default: None.
+        """
+
+    def __init__(self,
+                 embed_dims,
+                 feedforward_channels,
+                 output_channels,
+                 kernel_size=3,
+                 stride=2,
+                 padding=0,
+                 act_cfg=dict(type='GELU'),
+                 ffn_drop=0.,
+                 init_cfg=None):
         super(CnnEncoderLayer, self).__init__(init_cfg)
+
         self.embed_dims = embed_dims
         self.feedforward_channels = feedforward_channels
         self.output_channels = output_channels
         self.act_cfg = act_cfg
-        self.activate = build_activation_layer(act_cfg)\
-        
-        self.layers = MobileNetV3_Small(embed_dims=embed_dims,output_channels=output_channels)
+        self.activate = build_activation_layer(act_cfg)
+
+        self.layers = DepthWiseConvModule(embed_dims=embed_dims,
+                                          feedforward_channels=feedforward_channels // 2,
+                                          output_channels=output_channels,
+                                          kernel_size=kernel_size,
+                                          stride=stride,
+                                          padding=padding,
+                                          act_cfg=dict(type='GELU'),
+                                          ffn_drop=ffn_drop)
 
         self.norm = nn.BatchNorm2d(output_channels)
-        self.mdfa_block = MDFA(dim_in=output_channels, dim_out=output_channels)
+        self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
+
         self.residual = nn.ModuleList([
-            nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),
-            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.Sequential(
+            # 将 bias = False 改变为 bias = True
+            nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),  # 普通残差  
+            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),  # 下采样残差
+            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),  # 下采样残差
+            nn.Sequential(  # 带 BN 的残差
                 nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
                 nn.BatchNorm2d(output_channels)
             )
         ])
 
     def forward(self, x):
+
         # self.embed_dims => 3, 32, 64, 160   # self.output_channels => 32, 64, 160, 192
         # 第一次 x[16, 3, 256, 256] -> out1[16, 32, 64, 64] -> out2[16, 32, 64, 64]
         # 第二次 x[16, 32, 64, 64] -> out1[16, 64, 32, 32] -> out2[16, 64, 32, 32]
         # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
+
         out = self.layers(x)
 
 
         # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
-        out = self.mdfa_block(out)
+        out = self.multiscale_cbam(out)
 
-        _, _, H, W = out.shape
+        _, _, H, W=out.shape
 
         if H == 64:
             identity = self.residual[0](x)
@@ -783,13 +717,13 @@ class CnnEncoderLayer(BaseModule):
             identity = self.residual[2](x)
         else:
             identity = self.residual[3](x)
+
         if identity.shape != out.shape:
+            print(f"mismatch: identity={identity.shape}, out={out.shape}")
             identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
 
-        out = out + identity  # 确保这里不是就地操作
-
+        out += identity
         return out
-    
 
 # 原始的
 """
