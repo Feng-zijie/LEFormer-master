@@ -1,14 +1,13 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import math
 import warnings
-warnings.filterwarnings("ignore")
 from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
 import torch.nn.functional as F
-from typing import Sequence, Optional, Callable
+from typing import Sequence
 from mmcv.cnn import Conv2d
 from mmcv.cnn.bricks.drop import build_dropout
 from mmcv.cnn.bricks.transformer import MultiheadAttention
@@ -20,9 +19,6 @@ from mmcv.runner import BaseModule, ModuleList, Sequential
 from ..builder import BACKBONES
 from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
 
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
-from einops import rearrange, repeat
 
 class DepthWiseConvModule(BaseModule):
     """An implementation of one Depth-wise Conv Module of LEFormer.
@@ -405,447 +401,265 @@ class EfficientMultiheadAttention(MultiheadAttention):
         return identity + self.dropout_layer(self.proj_drop(out))
 
 
-# class TransformerEncoderLayer(BaseModule):
-#     def __init__(self,
-#                  embed_dims,
-#                  num_heads,
-#                  feedforward_channels,
-#                  drop_rate=0.,
-#                  attn_drop_rate=0.,
-#                  drop_path_rate=0.,
-#                  qkv_bias=True,
-#                  act_cfg=dict(type='GELU'),
-#                  norm_cfg=dict(type='LN'),
-#                  batch_first=True,
-#                  sr_ratio=1,
-#                  with_cp=False,
-#                  pool_size=3,
-#                  pool=False
-#                  ):
-#         super(TransformerEncoderLayer, self).__init__()
+class TransformerEncoderLayer(BaseModule):
+    """Implements one transformer encoder layer in LEFormer.
 
-#         # The ret[0] of build_norm_layer is norm name.
-#         self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
-
-#         self.attn = EfficientMultiheadAttention(
-#             embed_dims=embed_dims,
-#             num_heads=num_heads,
-#             attn_drop=attn_drop_rate,
-#             proj_drop=drop_rate,
-#             dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
-#             batch_first=batch_first,
-#             qkv_bias=qkv_bias,
-#             norm_cfg=norm_cfg,
-#             sr_ratio=sr_ratio,
-#             pool_size=pool_size,
-#             pool=pool
-#         )
-
-#         # The ret[0] of build_norm_layer is norm name.
-#         self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
-#         self.pool = pool
-#         if not self.pool:
-#             self.ffn = MixFFN(
-#                 embed_dims=embed_dims,
-#                 feedforward_channels=feedforward_channels,
-#                 ffn_drop=drop_rate,
-#                 dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
-#                 act_cfg=act_cfg)
-
-#         self.with_cp = with_cp
-
-#     def forward(self, x, hw_shape):
-
-#         def _inner_forward(x):
-#             x = self.attn(self.norm1(x), hw_shape, identity=x)
-#             if not self.pool:
-#                 x = self.ffn(self.norm2(x), hw_shape, identity=x)
-#             return x
-
-#         if self.with_cp and x.requires_grad:
-#             x = cp.checkpoint(_inner_forward, x)
-#         else:
-#             x = _inner_forward(x)
-#         return x
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-    
-class RoPE(torch.nn.Module):
-    r"""Rotary Positional Embedding.
-    """
-    def __init__(self, shape, base=10000):
-        super(RoPE, self).__init__()
-        channel_dims, feature_dim = shape[:-1], shape[-1]
-        k_max = feature_dim // (2 * len(channel_dims))
-        assert feature_dim % k_max == 0
-        # angles
-        theta_ks = 1 / (base ** (torch.arange(k_max) / k_max))
-        angles = torch.cat([t.unsqueeze(-1) * theta_ks for t in torch.meshgrid([torch.arange(d) for d in channel_dims], indexing='ij')], dim=-1)
-        # rotation
-        rotations_re = torch.cos(angles).unsqueeze(dim=-1)
-        rotations_im = torch.sin(angles).unsqueeze(dim=-1)
-        rotations = torch.cat([rotations_re, rotations_im], dim=-1)
-        self.register_buffer('rotations', rotations)
-    def forward(self, x):
-        if x.dtype != torch.float32:
-            x = x.to(torch.float32)
-        x = torch.view_as_complex(x.reshape(*x.shape[:-1], -1, 2))
-        pe_x = torch.view_as_complex(self.rotations) * x
-        return torch.view_as_real(pe_x).flatten(-2)
-    
-class LinearAttention(nn.Module):
-    r""" Linear Attention with LePE and RoPE.
     Args:
-        dim (int): Number of input channels.
-        num_heads (int): Number of attention heads.
-        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        embed_dims (int): The feature dimension.
+        num_heads (int): Parallel attention heads.
+        feedforward_channels (int): The hidden dimension for FFNs.
+        drop_rate (float): Probability of an element to be zeroed.
+            after the feed forward layer. Default 0.0.
+        attn_drop_rate (float): The drop out rate for attention layer.
+            Default 0.0.
+        drop_path_rate (float): stochastic depth rate. Default 0.0.
+        qkv_bias (bool): enable bias for qkv if True.
+            Default: True.
+        act_cfg (dict): The activation config for FFNs.
+            Default: dict(type='GELU').
+        norm_cfg (dict): Config dict for normalization layer.
+            Default: dict(type='LN').
+        batch_first (bool): Key, Query and Value are shape of
+            (batch, n, embed_dim)
+            or (n, batch, embed_dim). Default: False.
+        init_cfg (dict, optional): Initialization config dict.
+            Default:None.
+        sr_ratio (int): The ratio of spatial reduction of Efficient Multi-head
+            Attention of LEFormer. Default: 1.
+        with_cp (bool): Use checkpoint or not. Using checkpoint will save
+            some memory while slowing down the training speed. Default: False.
+        pool_size (int): Pooling size. Default: 3.
+        pool (bool): Whether to use Pooling Transformer Layer. Default: False.
     """
-    def __init__(self, dim, input_resolution, num_heads, qkv_bias=True, **kwargs):
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.qk = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        self.elu = nn.ELU()
-        self.lepe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.rope = RoPE(shape=(input_resolution[0], input_resolution[1], dim))
-    def forward(self, x):
-        """
-        Args:
-            x: input features with shape of (B, N, C)
-        """
-        b, n, c = x.shape
-        h, w = self.input_resolution
-
-        # 动态调整 h 和 w，确保 h * w == n
-        if h * w != n:
-            h = int(n ** 0.5)
-            w = n // h
-            if h * w != n:
-                raise ValueError(f"Cannot reshape input of length {n} into resolution ({h}, {w}).")
-
-        num_heads = self.num_heads
-        head_dim = c // num_heads
-        qk = self.qk(x).reshape(b, n, 2, c).permute(2, 0, 1, 3)
-        q, k, v = qk[0], qk[1], x
-        # q, k, v: b, n, c
-        q = self.elu(q) + 1.0
-        k = self.elu(k) + 1.0
-
-        # 确保 reshape 操作有效
-        q_rope = self.rope(q.reshape(b, h, w, c)).reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
-        k_rope = self.rope(k.reshape(b, h, w, c)).reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
-        q = q.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
-        k = k.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
-        v = v.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
-
-        z = 1 / (q @ k.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6)
-        kv = (k_rope.transpose(-2, -1) * (n ** -0.5)) @ (v * (n ** -0.5))
-        x = q_rope @ kv * z
-        x = x.transpose(1, 2).reshape(b, n, c)
-
-        v = v.transpose(1, 2).reshape(b, h, w, c).permute(0, 3, 1, 2)
-        x = x + self.lepe(v).permute(0, 2, 3, 1).reshape(b, n, c)
-        return x
-    
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, num_heads={self.num_heads}'
-    
-    
-class MLLABlock(nn.Module):
-    r""" MLLA Block.
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
-        num_heads (int): Number of attention heads.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-    def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, **kwargs):
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.mlp_ratio = mlp_ratio
-        self.cpe1 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.norm1 = norm_layer(dim)
-        self.in_proj = nn.Linear(dim, dim)
-        self.act_proj = nn.Linear(dim, dim)
-        self.dwc = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.act = nn.SiLU()
-        self.attn = LinearAttention(dim=dim, input_resolution=input_resolution, num_heads=num_heads, qkv_bias=qkv_bias)
-        self.out_proj = nn.Linear(dim, dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.cpe2 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
-    def forward(self, x):
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        x = x + self.cpe1(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
-        shortcut = x
-        x = self.norm1(x)
-        act_res = self.act(self.act_proj(x))
-        x = self.in_proj(x).view(B, H, W, C)
-        x = self.act(self.dwc(x.permute(0, 3, 1, 2))).permute(0, 2, 3, 1).view(B, L, C)
-        # Linear Attention
-        x = self.attn(x)
-        x = self.out_proj(x * act_res)
-        x = shortcut + self.drop_path(x)
-        x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
-        # FFN
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"mlp_ratio={self.mlp_ratio}"
-    
-
-
-
-class ChannelAttentionModule(BaseModule):
-    """An implementation of one Channel Attention Module of LEFormer.
-
-        Args:
-            embed_dims (int): The embedding dimension.
-    """
-
-    def __init__(self, embed_dims):
-        super(ChannelAttentionModule, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        self.shared_MLP = nn.Sequential(
-            Conv2d(embed_dims, embed_dims // 4, 1, bias=False),
-            nn.ReLU(),
-            Conv2d(embed_dims // 4, embed_dims, 1, bias=False)
-        )
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.shared_MLP(self.avg_pool(x))
-        max_out = self.shared_MLP(self.max_pool(x))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-
-class SpatialAttentionModule(BaseModule):
-    """An implementation of one Spatial Attention Module of LEFormer.
-
-        Args:
-            kernel_size (int): The kernel size of Conv2d. Default: 3.
-    """
-
-    def __init__(self, kernel_size=3):
-        super(SpatialAttentionModule, self).__init__()
-
-        padding = 3 if kernel_size == 7 else 1
-
-        self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-
-class MultiscaleCBAMLayer(BaseModule):
-    """An implementation of Multiscale CBAM layer of LEFormer.
-
-        Args:
-            embed_dims (int): The feature dimension.
-            kernel_size (int): The kernel size of Conv2d. Default: 7.
-        """
-
-    def __init__(self, embed_dims, kernel_size=7):
-        super(MultiscaleCBAMLayer, self).__init__()
-        self.channel_attention = ChannelAttentionModule(embed_dims // 4)
-        self.spatial_attention = SpatialAttentionModule(kernel_size)
-        self.multiscale_conv = nn.ModuleList()
-        for i in range(1, 5):
-            self.multiscale_conv.append(
-                Conv2d(
-                    in_channels=embed_dims // 4,
-                    out_channels=embed_dims // 4,
-                    kernel_size=3,
-                    stride=1,
-                    padding=(2 * i + 1) // 2,
-                    bias=True,
-                    dilation=(2 * i + 1) // 2)
-            )
-
-    def forward(self, x):
-        outs = torch.split(x, x.shape[1] // 4, dim=1)
-        out_list = []
-        for (i, out) in enumerate(outs):
-            out = self.multiscale_conv[i](out)
-            out = self.channel_attention(out) * out
-            out_list.append(out)
-        out = torch.cat(out_list, dim=1)
-        out = self.spatial_attention(out) * out
-        return out
-
-
-# class CnnEncoderLayer(BaseModule):
-#     """Implements one cnn encoder layer in LEFormer.
-
-#         Args:
-#             embed_dims (int): The feature dimension.
-#             feedforward_channels (int): The hidden dimension for FFNs.
-#             output_channels (int): The output channles of each cnn encoder layer.
-#             kernel_size (int): The kernel size of Conv2d. Default: 3.
-#             stride (int): The stride of Conv2d. Default: 2.
-#             padding (int): The padding of Conv2d. Default: 0.
-#             act_cfg (dict): The activation config for FFNs.
-#                 Default: dict(type='GELU').
-#             ffn_drop (float, optional): Probability of an element to be
-#                 zeroed in FFN. Default 0.0.
-#             init_cfg (dict, optional): Initialization config dict.
-#                 Default: None.
-#         """
-
-#     def __init__(self,
-#                  embed_dims,
-#                  feedforward_channels,
-#                  output_channels,
-#                  kernel_size=3,
-#                  stride=2,
-#                  padding=0,
-#                  act_cfg=dict(type='GELU'),
-#                  ffn_drop=0.,
-#                  init_cfg=None):
-#         super(CnnEncoderLayer, self).__init__(init_cfg)
-
-#         self.embed_dims = embed_dims
-#         self.feedforward_channels = feedforward_channels
-#         self.output_channels = output_channels
-#         self.act_cfg = act_cfg
-#         self.activate = build_activation_layer(act_cfg)
-
-#         self.layers = DepthWiseConvModule(embed_dims=embed_dims,
-#                                           feedforward_channels=feedforward_channels // 2,
-#                                           output_channels=output_channels,
-#                                           kernel_size=kernel_size,
-#                                           stride=stride,
-#                                           padding=padding,
-#                                           act_cfg=dict(type='GELU'),
-#                                           ffn_drop=ffn_drop)
-
-#         self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
-
-#     def forward(self, x):
-#         out = self.layers(x)
-#         out = self.multiscale_cbam(out)
-#         return out
-
-class CnnEncoderLayer(BaseModule):
-    """Implements one cnn encoder layer in LEFormer.
-
-        Args:
-            embed_dims (int): The feature dimension.
-            feedforward_channels (int): The hidden dimension for FFNs.
-            output_channels (int): The output channles of each cnn encoder layer.
-            kernel_size (int): The kernel size of Conv2d. Default: 3.
-            stride (int): The stride of Conv2d. Default: 2.
-            padding (int): The padding of Conv2d. Default: 0.
-            act_cfg (dict): The activation config for FFNs.
-                Default: dict(type='GELU').
-            ffn_drop (float, optional): Probability of an element to be
-                zeroed in FFN. Default 0.0.
-            init_cfg (dict, optional): Initialization config dict.
-                Default: None.
-        """
 
     def __init__(self,
                  embed_dims,
+                 num_heads,
                  feedforward_channels,
-                 output_channels,
-                 kernel_size=3,
-                 stride=2,
-                 padding=0,
+                 drop_rate=0.,
+                 attn_drop_rate=0.,
+                 drop_path_rate=0.,
+                 qkv_bias=True,
                  act_cfg=dict(type='GELU'),
-                 ffn_drop=0.,
-                 init_cfg=None):
-        super(CnnEncoderLayer, self).__init__(init_cfg)
+                 norm_cfg=dict(type='LN'),
+                 batch_first=True,
+                 sr_ratio=1,
+                 with_cp=False,
+                 pool_size=3,
+                 pool=False
+                 ):
+        super(TransformerEncoderLayer, self).__init__()
 
+        # The ret[0] of build_norm_layer is norm name.
+        self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
+
+        self.attn = EfficientMultiheadAttention(
+            embed_dims=embed_dims,
+            num_heads=num_heads,
+            attn_drop=attn_drop_rate,
+            proj_drop=drop_rate,
+            dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
+            batch_first=batch_first,
+            qkv_bias=qkv_bias,
+            norm_cfg=norm_cfg,
+            sr_ratio=sr_ratio,
+            pool_size=pool_size,
+            pool=pool
+        )
+
+        # The ret[0] of build_norm_layer is norm name.
+        self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
+        self.pool = pool
+        if not self.pool:
+            self.ffn = MixFFN(
+                embed_dims=embed_dims,
+                feedforward_channels=feedforward_channels,
+                ffn_drop=drop_rate,
+                dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
+                act_cfg=act_cfg)
+
+        self.with_cp = with_cp
+
+    def forward(self, x, hw_shape):
+
+        def _inner_forward(x):
+            x = self.attn(self.norm1(x), hw_shape, identity=x)
+            if not self.pool:
+                x = self.ffn(self.norm2(x), hw_shape, identity=x)
+            return x
+
+        if self.with_cp and x.requires_grad:
+            x = cp.checkpoint(_inner_forward, x)
+        else:
+            x = _inner_forward(x)
+        return x
+
+class tongdao(nn.Module):  #处理通道部分   函数名就是拼音名称
+    # 通道模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 自适应平均池化，输出大小为1x1
+        self.fc = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于降维
+        self.relu = nn.ReLU(inplace=False)  # ReLU激活函数，就地操作以节省内存
+
+    # 前向传播函数
+    def forward(self, x):
+        b, c, _, _ = x.size()  # 提取批次大小和通道数
+        y = self.avg_pool(x)  # 应用自适应平均池化
+        y = self.fc(y)  # 应用1x1卷积
+        y = self.relu(y)  # 应用ReLU激活
+        y = nn.functional.interpolate(y, size=(x.size(2), x.size(3)), mode='nearest')  # 调整y的大小以匹配x的空间维度
+        return x * y.expand_as(x)  # 将计算得到的通道权重应用到输入x上，实现特征重校准
+
+class kongjian(nn.Module):
+    # 空间模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.Conv1x1 = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于产生空间激励
+        self.norm = nn.Sigmoid()  # Sigmoid函数用于归一化
+
+    # 前向传播函数
+    def forward(self, x):
+        y = self.Conv1x1(x)  # 应用1x1卷积
+        y = self.norm(y)  # 应用Sigmoid函数
+        return x * y  # 将空间权重应用到输入x上，实现空间激励
+
+class hebing(nn.Module):    #函数名为合并, 意思是把空间和通道分别提取的特征合并起来
+    # 合并模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.tongdao = tongdao(in_channel)  # 创建通道子模块
+        self.kongjian = kongjian(in_channel)  # 创建空间子模块
+
+    # 前向传播函数
+    def forward(self, U):
+        U_kongjian = self.kongjian(U)  # 通过空间模块处理输入U
+        U_tongdao = self.tongdao(U)  # 通过通道模块处理输入U
+        return torch.max(U_tongdao, U_kongjian)  # 取两者的逐元素最大值，结合通道和空间激励
+
+
+# 修改所有 ReLU 的 inplace 参数为 False
+class MDFA(nn.Module):  # 多尺度空洞融合注意力模块
+    def __init__(self, dim_in, dim_out, rate=1, bn_mom=0.1):
+        super(MDFA, self).__init__()
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 1, 1, padding=0, dilation=rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=6 * rate, dilation=6 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=12 * rate, dilation=12 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch4 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=18 * rate, dilation=18 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch5_conv = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=True)
+        self.branch5_bn = nn.BatchNorm2d(dim_out, momentum=bn_mom)
+        self.branch5_relu = nn.ReLU(inplace=False)  
+
+        self.conv_cat = nn.Sequential(
+            nn.Conv2d(dim_out * 5, dim_out, 1, 1, padding=0, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False),
+        )
+        self.Hebing = hebing(in_channel=dim_out * 5)
+
+         # 添加下采样操作，使输出的长宽减半
+        self.downsample = nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=2, padding=1, bias=False)
+
+
+    def forward(self, x):
+        [b, c, row, col] = x.size()
+        conv1x1 = self.branch1(x)
+        conv3x3_1 = self.branch2(x)
+        conv3x3_2 = self.branch3(x)
+        conv3x3_3 = self.branch4(x)
+        global_feature = torch.mean(x, 2, True)
+        global_feature = torch.mean(global_feature, 3, True)
+        global_feature = self.branch5_conv(global_feature)
+        global_feature = self.branch5_bn(global_feature)
+        global_feature = self.branch5_relu(global_feature)
+        global_feature = F.interpolate(global_feature, (row, col), None, 'bilinear', True)
+        feature_cat = torch.cat([conv1x1, conv3x3_1, conv3x3_2, conv3x3_3, global_feature], dim=1)
+        larry = self.Hebing(feature_cat)
+        larry_feature_cat = larry * feature_cat
+        result = self.conv_cat(larry_feature_cat)
+
+        result = self.downsample(result)
+        
+        return result
+
+# 修改 CnnEncoderLayer 中的 ReLU
+class CnnEncoderLayer(BaseModule):
+    def __init__(self, embed_dims, feedforward_channels, output_channels, kernel_size=3, stride=2, padding=0, act_cfg=dict(type='GELU'), ffn_drop=0., init_cfg=None):
+        super(CnnEncoderLayer, self).__init__(init_cfg)
         self.embed_dims = embed_dims
         self.feedforward_channels = feedforward_channels
         self.output_channels = output_channels
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
-
-        self.layers = DepthWiseConvModule(embed_dims=embed_dims,
-                                          feedforward_channels=feedforward_channels // 2,
-                                          output_channels=output_channels,
-                                          kernel_size=kernel_size,
-                                          stride=stride,
-                                          padding=padding,
-                                          act_cfg=dict(type='GELU'),
-                                          ffn_drop=ffn_drop)
-
+        self.layers = DepthWiseConvModule(
+            embed_dims=embed_dims,
+            feedforward_channels=feedforward_channels // 2,
+            output_channels=output_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            act_cfg=dict(type='GELU'),
+            ffn_drop=ffn_drop
+        )
         self.norm = nn.BatchNorm2d(output_channels)
-        self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
-
+        self.mdfa_block = MDFA(dim_in=embed_dims, dim_out=output_channels)
         self.residual = nn.ModuleList([
-            # 将 bias = False 改变为 bias = True
-            nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),  # 普通残差  
-            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),  # 下采样残差
-            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),  # 下采样残差
-            nn.Sequential(  # 带 BN 的残差
+            nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),
+            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
+            nn.Sequential(
                 nn.Conv2d(embed_dims, output_channels, kernel_size=3, stride=2, padding=1, bias=True),
                 nn.BatchNorm2d(output_channels)
             )
         ])
+        self.conv1= nn.Conv2d(embed_dims, embed_dims, kernel_size=3, stride=2, padding=1, bias=True)
 
     def forward(self, x):
+        # self.embed_dims => 3, 32, 64, 160   # self.output_channels => 32, 64, 160, 192
+        # 第一次 x[16, 3, 256, 256] -> out1[16, 32, 64, 64] -> out2[16, 32, 64, 64]
+        # 第二次 x[16, 32, 64, 64] -> out1[16, 64, 32, 32] -> out2[16, 64, 32, 32]
+        # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
+        # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
+        
+        if x.shape[1] ==3:
+            x= self.conv1(x) 
 
-        # [16,3,256,256] -> [16,32,64,64] -> [16,32,64,64]
+        # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
+        out = self.mdfa_block(x)
 
-        out = self.layers(x)
-        out = self.multiscale_cbam(out)
+        # _, _, H, W = out.shape
 
-        _, _, H, W=out.shape
+        # if H == 64:
+        #     identity = self.residual[0](x)
+        # elif H == 32:
+        #     identity = self.residual[1](x)
+        # elif H == 16:
+        #     identity = self.residual[2](x)
+        # else:
+        #     identity = self.residual[3](x)
+        # if identity.shape != out.shape:
+        #     identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
 
-        if H == 64:
-            identity = self.residual[0](x)
-        elif H == 32:
-            identity = self.residual[1](x)
-        elif H == 16:
-            identity = self.residual[2](x)
-        else:
-            identity = self.residual[3](x)
+        # out = out + identity  # 确保这里不是就地操作
 
-        if identity.shape != out.shape:
-            print(f"mismatch: identity={identity.shape}, out={out.shape}")
-            identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
-
-        out += identity
         return out
+    
 
 # 原始的
 """
@@ -934,25 +748,14 @@ class CrossEncoderFusion(nn.Module):
         outs = []
         cnn_encoder_out = x
 
-        # 刚来的 x.shape 为 [16, 3, 256, 256]
-
-
         for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(zip(cnn_encoder_layers, transformer_encoder_layers)):
             # CNN 分支
             cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
 
-            # 经过 Transformer 编码器的每一层 : transformer_encoder_layer[0] -> transformer_encoder_layer[1]
-            # 1. torch.Size([16, 4096, 32]) (64, 64)   ->   torch.Size([16, 4096, 32]) (64, 64)
-            # 2. torch.Size([16, 1024, 64]) (32, 32)   ->   torch.Size([16, 1024, 64]) (32, 32)
-            # 3. torch.Size([16, 256, 160]) (16, 16)   ->   torch.Size([16, 256, 160]) (16, 16)
-            # 4. torch.Size([16, 64, 192]) (8, 8)   ->   torch.Size([16, 64, 192]) (8, 8)
             # Transformer 分支
             x, hw_shape = transformer_encoder_layer[0](x)
-
-
             for block in transformer_encoder_layer[1]:
-                x = block(x)
-                
+                x = block(x, hw_shape)
             x = transformer_encoder_layer[2](x)
             x = nlc_to_nchw(x, hw_shape)
 
@@ -1011,7 +814,7 @@ class LEFormer(BaseModule):
     """
 
     def __init__(self,
-                 in_channels=3, # DDD输入图像的通道数，RGB 图像一般是 3。
+                 in_channels=3, # 输入图像的通道数，RGB 图像一般是 3。
                  embed_dims=32, # 基础嵌入维度，用于 Transformer 的输入通道数。
                  num_stages=4, # 总共有 4 个阶段，每个阶段可以有不同的 层。
                  num_layers=(2, 2, 2, 3), # 每个阶段的 Transformer 层数。
@@ -1059,7 +862,7 @@ class LEFormer(BaseModule):
             (384,128, 2, 192)
         ]
 
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_5)
+        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_3)
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -1105,38 +908,25 @@ class LEFormer(BaseModule):
                 padding=patch_sizes[i] // 2,
                 norm_cfg=norm_cfg)
             feedforward_channels_list.append(mlp_ratio * embed_dims_i)
-
-            
-            if embed_dims_i==32:
-                self.input_resolution=(64,64)
-            elif embed_dims_i==64:
-                self.input_resolution=(32,32)
-            elif embed_dims_i==160:
-                self.input_resolution=(16,16)
-            elif embed_dims_i==192:
-                self.input_resolution=(8,8)
-                
             layer = ModuleList([
-                MLLABlock(
-                    dim=embed_dims_i, 
-                    input_resolution=self.input_resolution,
-                    num_heads=4
-                ) 
-            ])   
-                
-            # layer = ModuleList([
-            #     MLLABlock(
-            #         dim=embed_dims_i, 
-            #         input_resolution=self.input_resolution,
-            #         num_heads=4
-            #     ) 
-            #         for idx in range(num_layer)
-            # ])
-           
+                TransformerEncoderLayer(
+                    embed_dims=embed_dims_i,
+                    num_heads=num_heads[i],
+                    feedforward_channels=mlp_ratio * embed_dims_i,
+                    drop_rate=drop_rate,
+                    attn_drop_rate=attn_drop_rate,
+                    drop_path_rate=dpr[cur + idx],
+                    qkv_bias=qkv_bias,
+                    act_cfg=act_cfg,
+                    norm_cfg=norm_cfg,
+                    with_cp=with_cp,
+                    sr_ratio=sr_ratios[i],
+                    pool=i < pool_numbers
+                ) for idx in range(num_layer)
+            ])
             in_channels = embed_dims_i
             # The ret[0] of build_norm_layer is norm name.
             norm = build_norm_layer(norm_cfg, embed_dims_i)[1]
-            
             self.transformer_encoder_layers.append(ModuleList([patch_embed, layer, norm]))
             cur += num_layer
 
@@ -1172,6 +962,14 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
+            # return self.cross_encoder_fusion(
+            #     x,
+            #     cnn_encoder_layers=self.cnn_encoder_layers,
+            #     transformer_encoder_layers=self.transformer_encoder_layers,
+            #     fusion_conv_layers=self.fusion_conv_layers,
+            #     out_indices=self.out_indices
+            # )
+
              return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,

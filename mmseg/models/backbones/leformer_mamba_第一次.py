@@ -1,13 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import math
 import warnings
+warnings.filterwarnings("ignore")
 from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
 import torch.nn.functional as F
-from typing import Sequence
+from typing import Sequence, Optional, Callable
 from mmcv.cnn import Conv2d
 from mmcv.cnn.bricks.drop import build_dropout
 from mmcv.cnn.bricks.transformer import MultiheadAttention
@@ -18,7 +19,10 @@ from mmcv.runner import BaseModule, ModuleList, Sequential
 
 from ..builder import BACKBONES
 from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
-from mamba_ssm import Mamba
+
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
+from einops import rearrange, repeat
 
 class DepthWiseConvModule(BaseModule):
     """An implementation of one Depth-wise Conv Module of LEFormer.
@@ -400,44 +404,484 @@ class EfficientMultiheadAttention(MultiheadAttention):
 
         return identity + self.dropout_layer(self.proj_drop(out))
 
-from mamba_ssm import Mamba
-# ；论文：https://arxiv.org/pdf/2403.20035
-class PVMamba(nn.Module):
-    def __init__(self, input_dim, output_dim, d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.norm = nn.LayerNorm(input_dim)
-        self.mamba = Mamba(
-            d_model=input_dim // 4,  # Model dimension d_model
-            d_state=d_state,  # SSM state expansion factor
-            d_conv=d_conv,  # Local convolution width
-            expand=expand,  # Block expansion factor
-        )
-        self.proj = nn.Linear(input_dim, output_dim)
-        self.skip_scale = nn.Parameter(torch.ones(1))
+
+# class TransformerEncoderLayer(BaseModule):
+#     def __init__(self,
+#                  embed_dims,
+#                  num_heads,
+#                  feedforward_channels,
+#                  drop_rate=0.,
+#                  attn_drop_rate=0.,
+#                  drop_path_rate=0.,
+#                  qkv_bias=True,
+#                  act_cfg=dict(type='GELU'),
+#                  norm_cfg=dict(type='LN'),
+#                  batch_first=True,
+#                  sr_ratio=1,
+#                  with_cp=False,
+#                  pool_size=3,
+#                  pool=False
+#                  ):
+#         super(TransformerEncoderLayer, self).__init__()
+
+#         # The ret[0] of build_norm_layer is norm name.
+#         self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
+
+#         self.attn = EfficientMultiheadAttention(
+#             embed_dims=embed_dims,
+#             num_heads=num_heads,
+#             attn_drop=attn_drop_rate,
+#             proj_drop=drop_rate,
+#             dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
+#             batch_first=batch_first,
+#             qkv_bias=qkv_bias,
+#             norm_cfg=norm_cfg,
+#             sr_ratio=sr_ratio,
+#             pool_size=pool_size,
+#             pool=pool
+#         )
+
+#         # The ret[0] of build_norm_layer is norm name.
+#         self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
+#         self.pool = pool
+#         if not self.pool:
+#             self.ffn = MixFFN(
+#                 embed_dims=embed_dims,
+#                 feedforward_channels=feedforward_channels,
+#                 ffn_drop=drop_rate,
+#                 dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
+#                 act_cfg=act_cfg)
+
+#         self.with_cp = with_cp
+
+#     def forward(self, x, hw_shape):
+
+#         def _inner_forward(x):
+#             x = self.attn(self.norm1(x), hw_shape, identity=x)
+#             if not self.pool:
+#                 x = self.ffn(self.norm2(x), hw_shape, identity=x)
+#             return x
+
+#         if self.with_cp and x.requires_grad:
+#             x = cp.checkpoint(_inner_forward, x)
+#         else:
+#             x = _inner_forward(x)
+#         return x
+
+class ChannelAttention(nn.Module):
+    """Channel attention used in RCAN.
+    Args:
+        num_feat (int): Channel number of intermediate features.
+        squeeze_factor (int): Channel squeeze factor. Default: 16.
+    """
+
+    def __init__(self, num_feat, squeeze_factor=16):
+        super(ChannelAttention, self).__init__()
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(num_feat, num_feat // squeeze_factor, 1, padding=0),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_feat // squeeze_factor, num_feat, 1, padding=0),
+            nn.Sigmoid())
 
     def forward(self, x):
-        if x.dtype == torch.float16:
-            x = x.type(torch.float32)
-        B, C = x.shape[:2]
-        assert C == self.input_dim
-        n_tokens = x.shape[2:].numel()
-        img_dims = x.shape[2:]
-        x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2) #将B C L -->B L C
-        x_norm = self.norm(x_flat)
+        y = self.attention(x)
+        return x * y
 
-        x1, x2, x3, x4 = torch.chunk(x_norm, 4, dim=2)
-        x_mamba1 = self.mamba(x1) + self.skip_scale * x1
-        x_mamba2 = self.mamba(x2) + self.skip_scale * x2
-        x_mamba3 = self.mamba(x3) + self.skip_scale * x3
-        x_mamba4 = self.mamba(x4) + self.skip_scale * x4
-        x_mamba = torch.cat([x_mamba1, x_mamba2, x_mamba3, x_mamba4], dim=2)
 
-        x_mamba = self.norm(x_mamba)
-        x_mamba = self.proj(x_mamba)
-        out = x_mamba.transpose(-1, -2).reshape(B, self.output_dim, *img_dims)
+class CAB(nn.Module):
+    def __init__(self, num_feat, is_light_sr= False, compress_ratio=3,squeeze_factor=30):
+        super(CAB, self).__init__()
+        if is_light_sr: # we use depth-wise conv for light-SR to achieve more efficient
+            self.cab = nn.Sequential(
+                nn.Conv2d(num_feat, num_feat, 3, 1, 1, groups=num_feat),
+                ChannelAttention(num_feat, squeeze_factor)
+            )
+        else: # for classic SR
+            self.cab = nn.Sequential(
+                nn.Conv2d(num_feat, num_feat // compress_ratio, 3, 1, 1),
+                nn.GELU(),
+                nn.Conv2d(num_feat // compress_ratio, num_feat, 3, 1, 1),
+                ChannelAttention(num_feat, squeeze_factor)
+            )
+
+    def forward(self, x):
+        return self.cab(x)
+
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class DynamicPosBias(nn.Module):
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.pos_dim = dim // 4
+        self.pos_proj = nn.Linear(2, self.pos_dim)
+        self.pos1 = nn.Sequential(
+            nn.LayerNorm(self.pos_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.pos_dim, self.pos_dim),
+        )
+        self.pos2 = nn.Sequential(
+            nn.LayerNorm(self.pos_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.pos_dim, self.pos_dim)
+        )
+        self.pos3 = nn.Sequential(
+            nn.LayerNorm(self.pos_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.pos_dim, self.num_heads)
+        )
+
+    def forward(self, biases):
+        pos = self.pos3(self.pos2(self.pos1(self.pos_proj(biases))))
+        return pos
+
+    def flops(self, N):
+        flops = N * 2 * self.pos_dim
+        flops += N * self.pos_dim * self.pos_dim
+        flops += N * self.pos_dim * self.pos_dim
+        flops += N * self.pos_dim * self.num_heads
+        return flops
+
+
+class Attention(nn.Module):
+    r""" Multi-head self attention module with dynamic position bias.
+
+    Args:
+        dim (int): Number of input channels.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+    """
+
+    def __init__(self, dim, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.,
+                 position_bias=True):
+
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.position_bias = position_bias
+        if self.position_bias:
+            self.pos = DynamicPosBias(self.dim // 4, self.num_heads)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, H, W, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_groups*B, N, C)
+            mask: (0/-inf) mask with shape of (num_groups, Gh*Gw, Gh*Gw) or None
+            H: height of each group
+            W: width of each group
+        """
+        group_size = (H, W)
+        B_, N, C = x.shape
+        assert H * W == N
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))  # (B_, self.num_heads, N, N), N = H*W
+
+        if self.position_bias:
+            # generate mother-set
+            position_bias_h = torch.arange(1 - group_size[0], group_size[0], device=attn.device)
+            position_bias_w = torch.arange(1 - group_size[1], group_size[1], device=attn.device)
+            biases = torch.stack(torch.meshgrid([position_bias_h, position_bias_w]))  # 2, 2Gh-1, 2W2-1
+            biases = biases.flatten(1).transpose(0, 1).contiguous().float()  # (2h-1)*(2w-1) 2
+
+            # get pair-wise relative position index for each token inside the window
+            coords_h = torch.arange(group_size[0], device=attn.device)
+            coords_w = torch.arange(group_size[1], device=attn.device)
+            coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Gh, Gw
+            coords_flatten = torch.flatten(coords, 1)  # 2, Gh*Gw
+            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Gh*Gw, Gh*Gw
+            relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Gh*Gw, Gh*Gw, 2
+            relative_coords[:, :, 0] += group_size[0] - 1  # shift to start from 0
+            relative_coords[:, :, 1] += group_size[1] - 1
+            relative_coords[:, :, 0] *= 2 * group_size[1] - 1
+            relative_position_index = relative_coords.sum(-1)  # Gh*Gw, Gh*Gw
+
+            pos = self.pos(biases)  # 2Gh-1 * 2Gw-1, heads
+            # select position bias
+            relative_position_bias = pos[relative_position_index.view(-1)].view(
+                group_size[0] * group_size[1], group_size[0] * group_size[1], -1)  # Gh*Gw,Gh*Gw,nH
+            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Gh*Gw, Gh*Gw
+            attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nP = mask.shape[0]
+            attn = attn.view(B_ // nP, nP, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(
+                0)  # (B, nP, nHead, N, N)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class SS2D(nn.Module):
+    def __init__(
+            self,
+            d_model,
+            d_state=16,
+            d_conv=3,
+            expand=2.,
+            dt_rank="auto",
+            dt_min=0.001,
+            dt_max=0.1,
+            dt_init="random",
+            dt_scale=1.0,
+            dt_init_floor=1e-4,
+            dropout=0.,
+            conv_bias=True,
+            bias=False,
+            device=None,
+            dtype=None,
+            **kwargs,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.conv2d = nn.Conv2d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            groups=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            padding=(d_conv - 1) // 2,
+            **factory_kwargs,
+        )
+        self.act = nn.SiLU()
+
+        self.x_proj = (
+            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+            nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
+        )
+        self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K=4, N, inner)
+        del self.x_proj
+
+        self.dt_projs = (
+            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
+                         **factory_kwargs),
+            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
+                         **factory_kwargs),
+            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
+                         **factory_kwargs),
+            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
+                         **factory_kwargs),
+        )
+        self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))  # (K=4, inner, rank)
+        self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # (K=4, inner)
+        del self.dt_projs
+
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)  # (K=4, D, N)
+        self.Ds = self.D_init(self.d_inner, copies=4, merge=True)  # (K=4, D, N)
+
+        self.selective_scan = selective_scan_fn
+
+        self.out_norm = nn.LayerNorm(self.d_inner)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout) if dropout > 0. else None
+
+    @staticmethod
+    def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
+                **factory_kwargs):
+        dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+
+        # Initialize special dt projection to preserve variance at initialization
+        dt_init_std = dt_rank ** -0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError
+
+        # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+        dt = torch.exp(
+            torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            dt_proj.bias.copy_(inv_dt)
+        # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+        dt_proj.bias._no_reinit = True
+
+        return dt_proj
+
+    @staticmethod
+    def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
+        # S4D real initialization
+        A = repeat(
+            torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
+            "n -> d n",
+            d=d_inner,
+        ).contiguous()
+        A_log = torch.log(A)  # Keep A_log in fp32
+        if copies > 1:
+            A_log = repeat(A_log, "d n -> r d n", r=copies)
+            if merge:
+                A_log = A_log.flatten(0, 1)
+        A_log = nn.Parameter(A_log)
+        A_log._no_weight_decay = True
+        return A_log
+
+    @staticmethod
+    def D_init(d_inner, copies=1, device=None, merge=True):
+        # D "skip" parameter
+        D = torch.ones(d_inner, device=device)
+        if copies > 1:
+            D = repeat(D, "n1 -> r n1", r=copies)
+            if merge:
+                D = D.flatten(0, 1)
+        D = nn.Parameter(D)  # Keep in fp32
+        D._no_weight_decay = True
+        return D
+
+    def forward_core(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        L = H * W
+        K = 4
+        x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1).view(B, 2, -1, L)
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
+
+        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
+        dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
+        xs = xs.float().view(B, -1, L)
+        dts = dts.contiguous().float().view(B, -1, L) # (b, k * d, l)
+        Bs = Bs.float().view(B, K, -1, L)
+        Cs = Cs.float().view(B, K, -1, L) # (b, k, d_state, l)
+        Ds = self.Ds.float().view(-1)
+        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
+        dt_projs_bias = self.dt_projs_bias.float().view(-1) # (k * d)
+        out_y = self.selective_scan(
+            xs, dts,
+            As, Bs, Cs, Ds, z=None,
+            delta_bias=dt_projs_bias,
+            delta_softplus=True,
+            return_last_state=False,
+        ).view(B, K, -1, L)
+        assert out_y.dtype == torch.float
+
+        inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+        wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+        invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+
+        return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
+
+    def forward(self, x: torch.Tensor, **kwargs):
+        B, H, W, C = x.shape
+
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)
+
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = self.act(self.conv2d(x))
+        y1, y2, y3, y4 = self.forward_core(x)
+        assert y1.dtype == torch.float32
+        y = y1 + y2 + y3 + y4
+        y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
+        y = self.out_norm(y)
+        y = y * F.silu(z)
+        out = self.out_proj(y)
+        if self.dropout is not None:
+            out = self.dropout(out)
         return out
+
+
+class VSSBlock(nn.Module):
+    def __init__(
+            self,
+            hidden_dim: int = 0,
+            drop_path: float = 0,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+            attn_drop_rate: float = 0,
+            d_state: int = 16,
+            expand: float = 2.,
+            is_light_sr: bool = False,
+            **kwargs,
+    ):
+        super().__init__()
+        self.ln_1 = norm_layer(hidden_dim)
+        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, **kwargs)
+        self.drop_path = DropPath(drop_path)
+        self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
+        self.conv_blk = CAB(hidden_dim,is_light_sr)
+        self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
+
+
+
+    def forward(self, input, x_size):
+        # x [B,HW,C]
+        B, L, C = input.shape
+        input = input.view(B, *x_size, C).contiguous()  # [B,H,W,C]
+        x = self.ln_1(input)
+        x = input*self.skip_scale + self.drop_path(self.self_attention(x))
+        x = x*self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
+        x = x.view(B, -1, C).contiguous()
+        return x
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -528,7 +972,76 @@ class MultiscaleCBAMLayer(BaseModule):
         out = self.spatial_attention(out) * out
         return out
 
+
+# class CnnEncoderLayer(BaseModule):
+#     """Implements one cnn encoder layer in LEFormer.
+
+#         Args:
+#             embed_dims (int): The feature dimension.
+#             feedforward_channels (int): The hidden dimension for FFNs.
+#             output_channels (int): The output channles of each cnn encoder layer.
+#             kernel_size (int): The kernel size of Conv2d. Default: 3.
+#             stride (int): The stride of Conv2d. Default: 2.
+#             padding (int): The padding of Conv2d. Default: 0.
+#             act_cfg (dict): The activation config for FFNs.
+#                 Default: dict(type='GELU').
+#             ffn_drop (float, optional): Probability of an element to be
+#                 zeroed in FFN. Default 0.0.
+#             init_cfg (dict, optional): Initialization config dict.
+#                 Default: None.
+#         """
+
+#     def __init__(self,
+#                  embed_dims,
+#                  feedforward_channels,
+#                  output_channels,
+#                  kernel_size=3,
+#                  stride=2,
+#                  padding=0,
+#                  act_cfg=dict(type='GELU'),
+#                  ffn_drop=0.,
+#                  init_cfg=None):
+#         super(CnnEncoderLayer, self).__init__(init_cfg)
+
+#         self.embed_dims = embed_dims
+#         self.feedforward_channels = feedforward_channels
+#         self.output_channels = output_channels
+#         self.act_cfg = act_cfg
+#         self.activate = build_activation_layer(act_cfg)
+
+#         self.layers = DepthWiseConvModule(embed_dims=embed_dims,
+#                                           feedforward_channels=feedforward_channels // 2,
+#                                           output_channels=output_channels,
+#                                           kernel_size=kernel_size,
+#                                           stride=stride,
+#                                           padding=padding,
+#                                           act_cfg=dict(type='GELU'),
+#                                           ffn_drop=ffn_drop)
+
+#         self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
+
+#     def forward(self, x):
+#         out = self.layers(x)
+#         out = self.multiscale_cbam(out)
+#         return out
+
 class CnnEncoderLayer(BaseModule):
+    """Implements one cnn encoder layer in LEFormer.
+
+        Args:
+            embed_dims (int): The feature dimension.
+            feedforward_channels (int): The hidden dimension for FFNs.
+            output_channels (int): The output channles of each cnn encoder layer.
+            kernel_size (int): The kernel size of Conv2d. Default: 3.
+            stride (int): The stride of Conv2d. Default: 2.
+            padding (int): The padding of Conv2d. Default: 0.
+            act_cfg (dict): The activation config for FFNs.
+                Default: dict(type='GELU').
+            ffn_drop (float, optional): Probability of an element to be
+                zeroed in FFN. Default 0.0.
+            init_cfg (dict, optional): Initialization config dict.
+                Default: None.
+        """
 
     def __init__(self,
                  embed_dims,
@@ -573,15 +1086,10 @@ class CnnEncoderLayer(BaseModule):
 
     def forward(self, x):
 
-        # 第一次 x[16, 3, 256, 256] -> out1[16, 32, 64, 64] -> out2[16, 32, 64, 64]
-        # 第二次 x[16, 32, 64, 64] -> out1[16, 64, 32, 32] -> out2[16, 64, 32, 32]
-        # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
-        # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
+        # [16,3,256,256] -> [16,32,64,64] -> [16,32,64,64]
 
         out = self.layers(x)
-
-        
-        out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] [16, 64, 32, 32] [16, 160, 16, 16] [16, 192, 8, 8]
+        out = self.multiscale_cbam(out)
 
         _, _, H, W=out.shape
 
@@ -684,16 +1192,16 @@ class CrossEncoderFusion(nn.Module):
             for in_channels, growth_rate, num_layers, out_channels in fusion_out_channels
         ])
 
-    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, out_indices , hw_shape):
+    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, out_indices):
         outs = []
         cnn_encoder_out = x
 
         # 刚来的 x.shape 为 [16, 3, 256, 256]
 
+
         for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(zip(cnn_encoder_layers, transformer_encoder_layers)):
             # CNN 分支
             cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
-
 
             # 经过 Transformer 编码器的每一层 : transformer_encoder_layer[0] -> transformer_encoder_layer[1]
             # 1. torch.Size([16, 4096, 32]) (64, 64)   ->   torch.Size([16, 4096, 32]) (64, 64)
@@ -701,14 +1209,14 @@ class CrossEncoderFusion(nn.Module):
             # 3. torch.Size([16, 256, 160]) (16, 16)   ->   torch.Size([16, 256, 160]) (16, 16)
             # 4. torch.Size([16, 64, 192]) (8, 8)   ->   torch.Size([16, 64, 192]) (8, 8)
             # Transformer 分支
-            x = transformer_encoder_layer[0](x)
+            x, hw_shape = transformer_encoder_layer[0](x)
+
 
             for block in transformer_encoder_layer[1]:
-                x = block(x)
-
-            x = nchw_to_nlc(x)
+                x = block(x, hw_shape)
+                
             x = transformer_encoder_layer[2](x)
-            x = nlc_to_nchw(x, hw_shape[i])
+            x = nlc_to_nchw(x, hw_shape)
 
             # 拼接 CNN 和 Transformer 特征
             fusion_input = torch.cat((cnn_encoder_out, x), dim=1)
@@ -812,9 +1320,8 @@ class LEFormer(BaseModule):
             (320, 64, 2, 160),
             (384,128, 2, 192)
         ]
-        self.hw_shape = [(64, 64), (32, 32), (16, 16), (8, 8)]
 
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_3)
+        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_5)
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -860,15 +1367,16 @@ class LEFormer(BaseModule):
                 padding=patch_sizes[i] // 2,
                 norm_cfg=norm_cfg)
             feedforward_channels_list.append(mlp_ratio * embed_dims_i)
-            # 替换 Transformer 层为 PVMamba
             layer = ModuleList([
-                PVMamba(
-                    input_dim=embed_dims_i,
-                    output_dim=embed_dims_i,
-                    d_state=16,
-                    d_conv=4,
-                    expand=2
-                ) for _ in range(num_layer)
+                VSSBlock(
+                    hidden_dim=embed_dims_i, 
+                    drop_path=0.1, 
+                    attn_drop_rate=0.1, 
+                    d_state=16, 
+                    expand=2.0, 
+                    is_light_sr=False
+                    ) 
+                    for idx in range(num_layer)
             ])
             in_channels = embed_dims_i
             # The ret[0] of build_norm_layer is norm name.
@@ -908,10 +1416,17 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
+            # return self.cross_encoder_fusion(
+            #     x,
+            #     cnn_encoder_layers=self.cnn_encoder_layers,
+            #     transformer_encoder_layers=self.transformer_encoder_layers,
+            #     fusion_conv_layers=self.fusion_conv_layers,
+            #     out_indices=self.out_indices
+            # )
+
              return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,
                 transformer_encoder_layers=self.transformer_encoder_layers,
-                out_indices=self.out_indices,
-                hw_shape=self.hw_shape
+                out_indices=self.out_indices
             )

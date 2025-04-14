@@ -80,6 +80,10 @@ class MDFA(nn.Module):                       ##多尺度空洞融合注意力模
         )
         self.Hebing=hebing(in_channel=dim_out*5)# 整合通道和空间特征的合并模块
 
+         # 添加下采样操作，使输出的长宽减半
+        self.downsample = nn.Conv2d(dim_out, dim_out, kernel_size=3, stride=2, padding=1, bias=False)
+
+
     def forward(self, x):
         [b, c, row, col] = x.size()
         # 应用各分支
@@ -102,6 +106,14 @@ class MDFA(nn.Module):                       ##多尺度空洞融合注意力模
         # 最终输出经过降维处理
         result = self.conv_cat(larry_feature_cat)
 
+
+
+        # 添加下采样操作，使输出的长宽减半
+        result = self.downsample(result)
+        
+        
+        
+        
         return result
 
 
@@ -119,8 +131,8 @@ if __name__ == '__main__':
     model_stage4 = MDFA(dim_in=160, dim_out=192)  # 第四次输入 [16, 160, 16, 16] 输出 [16, 192, 8, 8]
 
     # 模拟输入数据
-    input_stage1 = torch.randn(16, 3, 256, 256)  # 输入 [16, 3, 256, 256]
-    output_stage1 = model_stage1(F.avg_pool2d(input_stage1, kernel_size=4, stride=4))  # 输出 [16, 32, 64, 64]
-    print(output_stage1.shape)  # 打印输出形状
+    input_stage2 = torch.randn(16, 3, 256, 256)  # 输入 [16, 3, 256, 256]
+    output_stage2 = model_stage1(input_stage2)  # 输出 [16, 32, 64, 64]
+    print(output_stage2.shape)  # 打印输出形状
 
 

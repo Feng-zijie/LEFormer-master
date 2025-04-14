@@ -417,18 +417,17 @@ class VSSBlock(nn.Module):
 
 if __name__ == '__main__':
     # 初始化VSSBlock模块，hidden_dim为128
-    block = VSSBlock(hidden_dim=128, drop_path=0.1, attn_drop_rate=0.1, d_state=16, expand=2.0, is_light_sr=False)
+    block = VSSBlock(hidden_dim=32, drop_path=0.1, attn_drop_rate=0.1, d_state=16, expand=2.0, is_light_sr=False)
 
     # 将模块转移到合适的设备上
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     block = block.to(device)
 
     # 生成随机输入张量，尺寸为[B, H*W, C]，这里模拟的是批次大小为4，每个图像的尺寸是32x32，通道数为128
-    B, H, W, C = 4, 32, 32, 128
-    input_tensor = torch.rand(B, H * W, C).to(device)
+    input_tensor = torch.rand(16, 4096, 32).to(device)
 
     # 计算输出
-    output_tensor = block(input_tensor, (H, W))
+    output_tensor = block(input_tensor, (64,64))
 
     # 打印输入和输出张量的尺寸
     print("Input tensor size:", input_tensor.size())
