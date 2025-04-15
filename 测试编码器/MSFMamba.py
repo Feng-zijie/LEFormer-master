@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import yaml
-from modules.Mamba_v3 import *
+from .MSFMamba_MambaV3.Mamba_v3 import *
 
 class Syn_layer(nn.Module):
     def __init__(self,hc1,hc2,sc1,sc2,hsi_N,img_size,d_state,lay_n,expand):
