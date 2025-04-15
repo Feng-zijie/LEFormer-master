@@ -104,6 +104,7 @@ class LinearAttention(nn.Module):
     
     def extra_repr(self) -> str:
         return f'dim={self.dim}, num_heads={self.num_heads}'
+    
 class MLLABlock(nn.Module):
     r""" MLLA Block.
     Args:

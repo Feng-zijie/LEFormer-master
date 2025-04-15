@@ -1014,7 +1014,7 @@ class LEFormer(BaseModule):
                  in_channels=3, # DDD输入图像的通道数，RGB 图像一般是 3。
                  embed_dims=32, # 基础嵌入维度，用于 Transformer 的输入通道数。
                  num_stages=4, # 总共有 4 个阶段，每个阶段可以有不同的 层。
-                 num_layers=(2, 2, 2, 3), # 每个阶段的 Transformer 层数。
+                 num_layers=(2, 4, 6, 2), # 每个阶段的 Transformer 层数。
                  num_heads=(1, 2, 5, 6), # 每个阶段的 Transformer 多头注意力的头数。
                  patch_sizes=(7, 3, 3, 3), # 每个阶段的 Patch Embedding 卷积核大小。
                  strides=(4, 2, 2, 2), # 每个阶段的 Patch Embedding 步长。
@@ -1116,22 +1116,22 @@ class LEFormer(BaseModule):
             elif embed_dims_i==192:
                 self.input_resolution=(8,8)
                 
-            layer = ModuleList([
-                MLLABlock(
-                    dim=embed_dims_i, 
-                    input_resolution=self.input_resolution,
-                    num_heads=4
-                ) 
-            ])   
-                
             # layer = ModuleList([
             #     MLLABlock(
             #         dim=embed_dims_i, 
             #         input_resolution=self.input_resolution,
             #         num_heads=4
             #     ) 
-            #         for idx in range(num_layer)
-            # ])
+            # ])   
+                
+            layer = ModuleList([
+                MLLABlock(
+                    dim=embed_dims_i, 
+                    input_resolution=self.input_resolution,
+                    num_heads=4
+                ) 
+                    for idx in range(num_layer)
+            ])
            
             in_channels = embed_dims_i
             # The ret[0] of build_norm_layer is norm name.
