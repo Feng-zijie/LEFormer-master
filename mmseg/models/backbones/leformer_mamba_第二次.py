@@ -824,9 +824,16 @@ class CnnEncoderLayer(BaseModule):
 
     def forward(self, x):
 
-        # [16,3,256,256] -> [16,32,64,64] -> [16,32,64,64]
+        # self.embed_dims => 3, 32, 64, 160   # self.output_channels => 32, 64, 160, 192
+        # 第一次 x[16, 3, 256, 256] -> out1[16, 32, 64, 64] -> out2[16, 32, 64, 64]
+        # 第二次 x[16, 32, 64, 64] -> out1[16, 64, 32, 32] -> out2[16, 64, 32, 32]
+        # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
+        # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
 
         out = self.layers(x)
+        
+        
+        # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
         out = self.multiscale_cbam(out)
 
         _, _, H, W=out.shape
