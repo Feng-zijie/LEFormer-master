@@ -1,12 +1,24 @@
 import torch
 import torch.nn as nn
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+
+from ..mmseg.models.utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
+from mmcv.cnn import Conv2d
+from mmcv.cnn.bricks.drop import build_dropout
+from mmcv.cnn.bricks.transformer import MultiheadAttention
+from mmcv.cnn.bricks import DropPath, build_activation_layer, build_norm_layer
+from mmcv.cnn.utils.weight_init import (constant_init, normal_init,
+                                        trunc_normal_init)
+from mmcv.runner import BaseModule, ModuleList, Sequential
+
+
 # 论文题目：Demystify Mamba in Vision: A Linear Attention Perspective
 # 中文题目：在视觉中揭开曼巴的神秘面纱：一种线性注意力视角
 # 论文链接：https://arxiv.org/pdf/2405.16605
 # 官方github：https://github.com/LeapLabTHU/MLLA
 # 所属机构：清华大学，阿里巴巴集团
 # 代码整理:微信公众号:AI缝合术
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -153,6 +165,9 @@ class MLLABlock(nn.Module):
         x = shortcut + self.drop_path(x)
         x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
         # FFN
+        print("x.shape", x.shape)
+        print("-"*100)
+        print("x.shape", x.shape)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
     def extra_repr(self) -> str:

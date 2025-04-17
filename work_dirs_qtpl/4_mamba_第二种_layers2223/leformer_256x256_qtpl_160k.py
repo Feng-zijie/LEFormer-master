@@ -32,14 +32,14 @@ model = dict(
             type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0)),
     train_cfg=dict(),
     test_cfg=dict(mode='whole'))
-dataset_type = 'SurfaceWaterDataset'
-data_root = '/home/wangzhecheng/Fengzijie/dataset_splited_SW'
+dataset_type = 'QTPLDataset'
+data_root = '/home/wangzhecheng/Fengzijie/dataset_splited_QTPL'
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 crop_size = (256, 256)
 train_pipeline = [
     dict(type='LoadImageFromFile'),
-    dict(type='LoadAnnotations'),
+    dict(type='LoadAnnotations', reduce_zero_label=False),
     dict(type='Resize', img_scale=(256, 256), ratio_range=(0.5, 2.0)),
     dict(type='RandomCrop', crop_size=(256, 256), cat_max_ratio=0.75),
     dict(type='RandomFlip', prob=0.5),
@@ -78,13 +78,13 @@ data = dict(
         type='RepeatDataset',
         times=50,
         dataset=dict(
-            type='SurfaceWaterDataset',
-            data_root='/home/wangzhecheng/Fengzijie/dataset_splited_SW',
+            type='QTPLDataset',
+            data_root='/home/wangzhecheng/Fengzijie/dataset_splited_QTPL',
             img_dir='images/training',
             ann_dir='binary_annotations/training',
             pipeline=[
                 dict(type='LoadImageFromFile'),
-                dict(type='LoadAnnotations'),
+                dict(type='LoadAnnotations', reduce_zero_label=False),
                 dict(
                     type='Resize',
                     img_scale=(256, 256),
@@ -105,8 +105,8 @@ data = dict(
                 dict(type='Collect', keys=['img', 'gt_semantic_seg'])
             ])),
     val=dict(
-        type='SurfaceWaterDataset',
-        data_root='/home/wangzhecheng/Fengzijie/dataset_splited_SW',
+        type='QTPLDataset',
+        data_root='/home/wangzhecheng/Fengzijie/dataset_splited_QTPL',
         img_dir='images/validation',
         ann_dir='binary_annotations/validation',
         pipeline=[
@@ -128,8 +128,8 @@ data = dict(
                 ])
         ]),
     test=dict(
-        type='SurfaceWaterDataset',
-        data_root='/home/wangzhecheng/Fengzijie/dataset_splited_SW',
+        type='QTPLDataset',
+        data_root='/home/wangzhecheng/Fengzijie/dataset_splited_QTPL',
         img_dir='images/validation',
         ann_dir='binary_annotations/validation',
         pipeline=[
@@ -167,7 +167,7 @@ optimizer = dict(
         custom_keys=dict(
             pos_block=dict(decay_mult=0.0),
             norm=dict(decay_mult=0.0),
-            head=dict(lr_mult=2.0))))
+            head=dict(lr_mult=10.0))))
 optimizer_config = dict()
 lr_config = dict(
     policy='poly',

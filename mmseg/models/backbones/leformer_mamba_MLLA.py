@@ -736,22 +736,22 @@ class LEFormer(BaseModule):
             elif embed_dims_i==192:
                 self.input_resolution=(8,8)
                 
-            # layer = ModuleList([
-            #     MLLABlock(
-            #         dim=embed_dims_i, 
-            #         input_resolution=self.input_resolution,
-            #         num_heads=4
-            #     ) 
-            # ])   
-                
             layer = ModuleList([
                 MLLABlock(
                     dim=embed_dims_i, 
                     input_resolution=self.input_resolution,
                     num_heads=4
                 ) 
-                    for idx in range(num_layer)
-            ])
+            ])   
+                
+            # layer = ModuleList([
+            #     MLLABlock(
+            #         dim=embed_dims_i, 
+            #         input_resolution=self.input_resolution,
+            #         num_heads=4
+            #     ) 
+            #         for idx in range(num_layer)
+            # ])
            
             in_channels = embed_dims_i
             # The ret[0] of build_norm_layer is norm name.

@@ -581,59 +581,6 @@ class MultiscaleCBAMLayer(BaseModule):
         out = self.spatial_attention(out) * out
         return out
 
-
-# class CnnEncoderLayer(BaseModule):
-#     """Implements one cnn encoder layer in LEFormer.
-
-#         Args:
-#             embed_dims (int): The feature dimension.
-#             feedforward_channels (int): The hidden dimension for FFNs.
-#             output_channels (int): The output channles of each cnn encoder layer.
-#             kernel_size (int): The kernel size of Conv2d. Default: 3.
-#             stride (int): The stride of Conv2d. Default: 2.
-#             padding (int): The padding of Conv2d. Default: 0.
-#             act_cfg (dict): The activation config for FFNs.
-#                 Default: dict(type='GELU').
-#             ffn_drop (float, optional): Probability of an element to be
-#                 zeroed in FFN. Default 0.0.
-#             init_cfg (dict, optional): Initialization config dict.
-#                 Default: None.
-#         """
-
-#     def __init__(self,
-#                  embed_dims,
-#                  feedforward_channels,
-#                  output_channels,
-#                  kernel_size=3,
-#                  stride=2,
-#                  padding=0,
-#                  act_cfg=dict(type='GELU'),
-#                  ffn_drop=0.,
-#                  init_cfg=None):
-#         super(CnnEncoderLayer, self).__init__(init_cfg)
-
-#         self.embed_dims = embed_dims
-#         self.feedforward_channels = feedforward_channels
-#         self.output_channels = output_channels
-#         self.act_cfg = act_cfg
-#         self.activate = build_activation_layer(act_cfg)
-
-#         self.layers = DepthWiseConvModule(embed_dims=embed_dims,
-#                                           feedforward_channels=feedforward_channels // 2,
-#                                           output_channels=output_channels,
-#                                           kernel_size=kernel_size,
-#                                           stride=stride,
-#                                           padding=padding,
-#                                           act_cfg=dict(type='GELU'),
-#                                           ffn_drop=ffn_drop)
-
-#         self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
-
-#     def forward(self, x):
-#         out = self.layers(x)
-#         out = self.multiscale_cbam(out)
-#         return out
-
 class CnnEncoderLayer(BaseModule):
     """Implements one cnn encoder layer in LEFormer.
 

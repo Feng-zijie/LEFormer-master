@@ -1321,7 +1321,7 @@ class LEFormer(BaseModule):
             (384,128, 2, 192)
         ]
 
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_5)
+        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_3)
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
