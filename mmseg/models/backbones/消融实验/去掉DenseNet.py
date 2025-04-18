@@ -1,13 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import math
 import warnings
+warnings.filterwarnings("ignore")
 from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
 import torch.nn.functional as F
-from typing import Sequence
+from typing import Sequence, Optional, Callable
 from mmcv.cnn import Conv2d
 from mmcv.cnn.bricks.drop import build_dropout
 from mmcv.cnn.bricks.transformer import MultiheadAttention
@@ -19,6 +20,9 @@ from mmcv.runner import BaseModule, ModuleList, Sequential
 from ..builder import BACKBONES
 from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
 
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
+from einops import rearrange, repeat
 
 class DepthWiseConvModule(BaseModule):
     """An implementation of one Depth-wise Conv Module of LEFormer.
@@ -77,6 +81,63 @@ class DepthWiseConvModule(BaseModule):
     def forward(self, x):
         return self.layers(x)
 
+class TransformerEncoderLayerCustom(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True, dropout=0.1, activation='gelu'):
+        super(TransformerEncoderLayerCustom, self).__init__()
+        # 使用标准的MultiheadAttention，如果需要可以替换为自定义的LinearAttention
+        self.self_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout)
+        
+        # 前馈网络
+        self.linear1 = nn.Linear(dim, int(dim * mlp_ratio))
+        self.activation = nn.GELU() if activation == 'gelu' else nn.ReLU()
+        self.linear2 = nn.Linear(int(dim * mlp_ratio), dim)
+        
+        # 层归一化和Dropout
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        """
+        Args:
+            src: Input tensor of shape (B, N, C)
+            src_mask: Mask for the src sequence (optional)
+            src_key_padding_mask: Mask for the src keys per batch (optional)
+        """
+        # Multi-head Self Attention
+        src2 = self.self_attn(src, src, src, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        
+        # Feed Forward
+        src2 = self.linear2(self.dropout1(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        
+        return src
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, dim, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, dim)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)  # (max_len, 1, dim)
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (B, N, C)
+        Returns:
+            Tensor with positional encoding added.
+        """
+        B, N, C = x.shape
+        return x + self.pe[:N, :, :].to(x.device)
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -94,6 +155,7 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
+    
     
 class RoPE(torch.nn.Module):
     r"""Rotary Positional Embedding.
@@ -179,25 +241,28 @@ class LinearAttention(nn.Module):
     
 class MLLABlock(nn.Module):
     r""" MLLA Block.
+
     Args:
         dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
+        input_resolution (tuple[int]): Input resolution.
         num_heads (int): Number of attention heads.
         mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
         qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
         drop (float, optional): Dropout rate. Default: 0.0
         drop_path (float, optional): Stochastic depth rate. Default: 0.0
         act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
     """
+
     def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm, **kwargs):
         super().__init__()
+        
         self.dim = dim
         self.input_resolution = input_resolution
         self.num_heads = num_heads
         self.mlp_ratio = mlp_ratio
-        self.cpe1 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+
         self.norm1 = norm_layer(dim)
         self.in_proj = nn.Linear(dim, dim)
         self.act_proj = nn.Linear(dim, dim)
@@ -207,29 +272,210 @@ class MLLABlock(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.cpe2 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
-    def forward(self, x):
+
+    def forward(self, x, shortcut):
         H, W = self.input_resolution
         B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        x = x + self.cpe1(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
-        shortcut = x
-        x = self.norm1(x)
+
         act_res = self.act(self.act_proj(x))
         x = self.in_proj(x).view(B, H, W, C)
         x = self.act(self.dwc(x.permute(0, 3, 1, 2))).permute(0, 2, 3, 1).view(B, L, C)
+
         # Linear Attention
         x = self.attn(x)
+
         x = self.out_proj(x * act_res)
         x = shortcut + self.drop_path(x)
         x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+
+        return x
+    
+# Mamba-Inspired Linear Attention (MILA)
+class MILA(nn.Module):
+
+    def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,**kwargs):
+        super().__init__()
+        
+        self.mlla_block = MLLABlock(
+            dim=dim,
+            input_resolution=input_resolution,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            drop=drop,
+            drop_path=drop_path,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+            **kwargs
+        )
+        
+        self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        self.norm1 = norm_layer(dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+    def forward(self, x):
+        H, W = self.mlla_block.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        x = x + self.cpe(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+        shortcut = x
+        x = self.norm1(x)
+        
+        x=self.mlla_block(x,shortcut)
+        
         # FFN
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"mlp_ratio={self.mlp_ratio}"
+    
+
+def gauss_kernel(channels=3, cuda=True):
+    kernel = torch.tensor([[1., 4., 6., 4., 1],
+                           [4., 16., 24., 16., 4.],
+                           [6., 24., 36., 24., 6.],
+                           [4., 16., 24., 16., 4.],
+                           [1., 4., 6., 4., 1.]])
+    kernel /= 256.
+    kernel = kernel.repeat(channels, 1, 1, 1)
+    if cuda:
+        kernel = kernel.cuda()
+    return kernel
+
+
+def downsample(x):
+    return x[:, :, ::2, ::2]
+
+
+def conv_gauss(img, kernel):
+    kernel = kernel.to(img.device)  # 将 kernel 移动到 img 的设备
+    img = F.pad(img, (2, 2, 2, 2), mode='reflect')
+    out = F.conv2d(img, kernel, groups=img.shape[1])
+    return out
+
+
+def upsample(x, channels):
+    cc = torch.cat([x, torch.zeros(x.shape[0], x.shape[1], x.shape[2], x.shape[3], device=x.device)], dim=3)
+    cc = cc.view(x.shape[0], x.shape[1], x.shape[2] * 2, x.shape[3])
+    cc = cc.permute(0, 1, 3, 2)
+    cc = torch.cat([cc, torch.zeros(x.shape[0], x.shape[1], x.shape[3], x.shape[2] * 2, device=x.device)], dim=3)
+    cc = cc.view(x.shape[0], x.shape[1], x.shape[3] * 2, x.shape[2] * 2)
+    x_up = cc.permute(0, 1, 3, 2)
+    return conv_gauss(x_up, 4 * gauss_kernel(channels))
+
+
+def make_laplace(img, channels):
+    filtered = conv_gauss(img, gauss_kernel(channels))
+    down = downsample(filtered)
+    up = upsample(down, channels)
+    if up.shape[2] != img.shape[2] or up.shape[3] != img.shape[3]:
+        up = nn.functional.interpolate(up, size=(img.shape[2], img.shape[3]))
+    diff = img - up
+    return diff
+
+
+def make_laplace_pyramid(img, level, channels):
+    current = img
+    pyr = []
+    for _ in range(level):
+        filtered = conv_gauss(current, gauss_kernel(channels))
+        down = downsample(filtered)
+        up = upsample(down, channels)
+        if up.shape[2] != current.shape[2] or up.shape[3] != current.shape[3]:
+            up = nn.functional.interpolate(up, size=(current.shape[2], current.shape[3]))
+        diff = current - up
+        pyr.append(diff)
+        current = down
+    pyr.append(current)
+    return pyr
+
+
+class ChannelGate(nn.Module):
+    def __init__(self, gate_channels, reduction_ratio=16):
+        super(ChannelGate, self).__init__()
+        self.gate_channels = gate_channels
+        self.mlp = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(gate_channels, gate_channels // reduction_ratio),
+            nn.ReLU(),
+            nn.Linear(gate_channels // reduction_ratio, gate_channels)
+        )
+    def forward(self, x):
+        avg_out = self.mlp(F.avg_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))).unsqueeze(-1).unsqueeze(-1)
+        max_out = self.mlp(F.max_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))).unsqueeze(-1).unsqueeze(-1)
+        channel_att_sum = avg_out + max_out
+
+        scale = torch.sigmoid(channel_att_sum).expand_as(x)
+        return x * scale
+
+class SpatialGate(nn.Module):
+    def __init__(self):
+        super(SpatialGate, self).__init__()
+        kernel_size = 7
+        self.spatial = nn.Conv2d(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2)
+
+    def forward(self, x):
+        x_compress = torch.cat((torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
+        x_out = self.spatial(x_compress)
+        scale = torch.sigmoid(x_out)  # broadcasting
+        return x * scale
+    
+class CBAM(nn.Module):
+    def __init__(self, gate_channels, reduction_ratio=16):
+        super(CBAM, self).__init__()
+        self.ChannelGate = ChannelGate(gate_channels, reduction_ratio)
+        self.SpatialGate = SpatialGate()
+
+    def forward(self, x):
+        x_out = self.ChannelGate(x)
+        x_out = self.SpatialGate(x_out)
+        return x_out
+
+# Edge-Guided Attention Module
+class EGA(nn.Module):
+    def __init__(self, in_channels):
+        super(EGA, self).__init__()
+
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(in_channels * 3, in_channels, 3, 1, 1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True))
+
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels, 1, 3, 1, 1),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid())
+
+        self.cbam = CBAM(in_channels)
+        self.pred_conv = nn.Conv2d(in_channels, 1, kernel_size=3, stride=1, padding=1)  # 用于生成 pred
+
+    def forward(self, edge_feature, x):
+        residual = x
+        xsize = x.size()[2:]
+
+        pred = torch.sigmoid(self.pred_conv(x))
+
+        # reverse attention
+        background_att = 1 - pred
+        background_x = x * background_att
+
+        # boudary attention
+        edge_pred = make_laplace(pred, 1)
+        pred_feature = x * edge_pred
+
+        # high-frequency feature
+        edge_input = F.interpolate(edge_feature, size=xsize, mode='bilinear', align_corners=True)
+        input_feature = x * edge_input
+
+        fusion_feature = torch.cat([background_x, pred_feature, input_feature], dim=1)
+        fusion_feature = self.fusion_conv(fusion_feature)
+
+        attention_map = self.attention(fusion_feature)
+        fusion_feature = fusion_feature * attention_map
+
+        out = fusion_feature + residual
+        out = self.cbam(out)
+        return out
 
 class CnnEncoderLayer(BaseModule):
     """Implements one cnn encoder layer in LEFormer.
@@ -277,6 +523,8 @@ class CnnEncoderLayer(BaseModule):
                                           ffn_drop=ffn_drop)
 
         self.norm = nn.BatchNorm2d(output_channels)
+        
+        self.ega_block = EGA(output_channels)
 
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
@@ -298,6 +546,11 @@ class CnnEncoderLayer(BaseModule):
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
 
         out = self.layers(x)
+        
+        
+        # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
+        edge_feature = make_laplace(out, channels=self.output_channels)
+        out = self.ega_block(edge_feature,out)
 
         _, _, H, W=out.shape
 
@@ -315,90 +568,45 @@ class CnnEncoderLayer(BaseModule):
             identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
 
         out += identity
-        out = F.relu(out)
+        
+        out = F.relu(out) 
         return out
 
-
-
-# cross 变体
-class DenseLayer(nn.Module):
-    """Dense Block 内部的一层"""
-    def __init__(self, in_channels, growth_rate):
-        super(DenseLayer, self).__init__()
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.conv1 = nn.Conv2d(in_channels, 4 * growth_rate, kernel_size=1, bias=True)
-        
-        self.bn2 = nn.BatchNorm2d(4 * growth_rate)
-        self.conv2 = nn.Conv2d(4 * growth_rate, growth_rate, kernel_size=3, padding=1, bias=True)
-
-    def forward(self, x):
-        out = self.conv1(F.relu(self.bn1(x)))
-        out = self.conv2(F.relu(self.bn2(out)))
-        return torch.cat([x, out], dim=1)  # 维度拼接，增加通道数
-
-class DenseBlock(nn.Module):
-    """包含多个 DenseLayer,并使用 1x1 卷积降维"""
-    def __init__(self, num_layers, in_channels, growth_rate, out_channels):
-        super(DenseBlock, self).__init__()
-        self.layers = nn.ModuleList()
-        current_channels = in_channels  # 记录当前通道数
-        
-        for _ in range(num_layers):
-            self.layers.append(DenseLayer(current_channels, growth_rate))
-            current_channels += growth_rate  # 每层增加 growth_rate 个通道
-        
-        # 使用 1x1 卷积降维到目标通道数
-        self.conv1x1 = nn.Conv2d(current_channels, out_channels, kernel_size=1, bias=True)
-        self.bn = nn.BatchNorm2d(out_channels)
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)  # 逐层拼接
-        x = self.conv1x1(x)  # 1x1 降维
-        x = F.relu(self.bn(x))  # BN + ReLU
-        return x
-
+# 原始的
 class CrossEncoderFusion(nn.Module):
-    def __init__(self, fusion_out_channels):
+    def __init__(self):
         super(CrossEncoderFusion, self).__init__()
-        
-        self.fusion_blocks = nn.ModuleList([
-            DenseBlock(num_layers, in_channels, growth_rate, out_channels) 
-            for in_channels, growth_rate, num_layers, out_channels in fusion_out_channels
-        ])
 
-    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, out_indices):
+    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, fusion_conv_layers, out_indices):
         outs = []
         cnn_encoder_out = x
 
-        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(zip(cnn_encoder_layers, transformer_encoder_layers)):
-            # CNN 分支
-        
-            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
-
-            # 经过 Transformer 编码器的每一层 : transformer_encoder_layer[0] -> transformer_encoder_layer[1]
-            # 1. torch.Size([16, 4096, 32]) (64, 64)   ->   torch.Size([16, 4096, 32]) (64, 64)
-            # 2. torch.Size([16, 1024, 64]) (32, 32)   ->   torch.Size([16, 1024, 64]) (32, 32)
-            # 3. torch.Size([16, 256, 160]) (16, 16)   ->   torch.Size([16, 256, 160]) (16, 16)
-            # 4. torch.Size([16, 64, 192]) (8, 8)   ->   torch.Size([16, 64, 192]) (8, 8)
-            # Transformer 分支
+        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(
+                zip(cnn_encoder_layers, transformer_encoder_layers)):
+            
+            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out) # [16, 3, 256, 256] → [16, 32, 128, 128] → [16, 64, 64, 64] → [16, 128, 32, 32] → [16, 256, 16, 16]
+            
             x, hw_shape = transformer_encoder_layer[0](x)
+            
             
             for block in transformer_encoder_layer[1]:
                 x = block(x)
+
+            
+            # 过了block后的x的shape
+            # torch.Size([16, 4096, 32])   torch.Size([16, 1024, 64])  torch.Size([16, 256, 160])  torch.Size([16, 64, 192])
+
             x = transformer_encoder_layer[2](x)
             x = nlc_to_nchw(x, hw_shape)
 
-            # 拼接 CNN 和 Transformer 特征
-            fusion_input = torch.cat((cnn_encoder_out, x), dim=1)
-
-            # 经过 DenseBlock 进行融合
-            x = self.fusion_blocks[i](fusion_input)
+            x = torch.cat((x, cnn_encoder_out), dim=1)
+            
+            x = fusion_conv_layers[i](x)
 
             if i in out_indices:
                 outs.append(x)
-
         return outs
+
 
 @BACKBONES.register_module()
 class LEFormer(BaseModule):
@@ -465,34 +673,8 @@ class LEFormer(BaseModule):
                  init_cfg=None,
                  with_cp=False):
         super(LEFormer, self).__init__(init_cfg=init_cfg)
-
-        # cross 变体
-        self.fusion_out_channels_5 = [
-            (64, 16, 5, 32),  
-            (128, 32, 5, 64),  
-            (320, 64, 5, 160),
-            (384,128, 5, 192)
-        ]
-        self.fusion_out_channels_4 = [
-            (64, 16, 4, 32),  
-            (128, 32, 4, 64),  
-            (320, 64, 4, 160),
-            (384,128, 4, 192)
-        ]
-        self.fusion_out_channels_3 = [
-            (64, 16, 3, 32),  
-            (128, 32, 3, 64),  
-            (320, 64, 3, 160),
-            (384,128, 3, 192)
-        ]
-        self.fusion_out_channels_2 = [
-            (64, 16, 2, 32),  
-            (128, 32, 2, 64),  
-            (320, 64, 2, 160),
-            (384,128, 2, 192)
-        ]
-
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_3)
+        
+        self.cross_encoder_fusion=CrossEncoderFusion() 
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -518,11 +700,6 @@ class LEFormer(BaseModule):
         self.out_indices = out_indices
         assert max(out_indices) < self.num_stages
 
-        dpr = [
-            x.item()
-            for x in torch.linspace(0, drop_path_rate, sum(num_layers))
-        ]  # stochastic num_layer decay rule
-
         cur = 0
         embed_dims_list = []
         feedforward_channels_list = []
@@ -538,6 +715,7 @@ class LEFormer(BaseModule):
                 padding=patch_sizes[i] // 2,
                 norm_cfg=norm_cfg)
             feedforward_channels_list.append(mlp_ratio * embed_dims_i)
+
             
             if embed_dims_i==32:
                 self.input_resolution=(64,64)
@@ -546,25 +724,26 @@ class LEFormer(BaseModule):
             elif embed_dims_i==160:
                 self.input_resolution=(16,16)
             elif embed_dims_i==192:
-                self.input_resolution=(8,8)
-            
+                self.input_resolution=(8,8) 
                 
             layer = ModuleList([
-                MLLABlock(
+                MILA(
                     dim=embed_dims_i, 
                     input_resolution=self.input_resolution,
                     num_heads=4
                 ) 
                     for idx in range(num_layer)
             ])
-            
+           
             in_channels = embed_dims_i
             # The ret[0] of build_norm_layer is norm name.
             norm = build_norm_layer(norm_cfg, embed_dims_i)[1]
+            
             self.transformer_encoder_layers.append(ModuleList([patch_embed, layer, norm]))
             cur += num_layer
 
         self.cnn_encoder_layers = nn.ModuleList()
+        self.fusion_conv_layers = nn.ModuleList()
 
         for i in range(num_stages):
             self.cnn_encoder_layers.append(
@@ -578,6 +757,16 @@ class LEFormer(BaseModule):
                     ffn_drop=drop_rate
                 )
             )
+            self.fusion_conv_layers.append(
+                Conv2d(
+                    in_channels=embed_dims_list[i] * 2,
+                    out_channels=embed_dims_list[i],
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=True)
+            )
+            
 
     def init_weights(self):
         if self.init_cfg is None:
@@ -596,10 +785,10 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
-
              return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,
                 transformer_encoder_layers=self.transformer_encoder_layers,
+                fusion_conv_layers=self.fusion_conv_layers,
                 out_indices=self.out_indices
             )

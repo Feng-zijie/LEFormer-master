@@ -708,11 +708,9 @@ class CrossEncoderFusion(nn.Module):
 
 """
 
-# cross 变体
-class DenseLayer(nn.Module):
-    """Dense Block 内部的一层"""
+class A(nn.Module):
     def __init__(self, in_channels, growth_rate):
-        super(DenseLayer, self).__init__()
+        super(A, self).__init__()
         self.bn1 = nn.BatchNorm2d(in_channels)
         self.conv1 = nn.Conv2d(in_channels, 4 * growth_rate, kernel_size=1, bias=True)
         
@@ -722,28 +720,27 @@ class DenseLayer(nn.Module):
     def forward(self, x):
         out = self.conv1(F.relu(self.bn1(x)))
         out = self.conv2(F.relu(self.bn2(out)))
-        return torch.cat([x, out], dim=1)  # 维度拼接，增加通道数
+        return torch.cat([x, out], dim=1) 
 
-class DenseBlock(nn.Module):
-    """包含多个 DenseLayer,并使用 1x1 卷积降维"""
+class B(nn.Module):
+
     def __init__(self, num_layers, in_channels, growth_rate, out_channels):
-        super(DenseBlock, self).__init__()
+        super(B, self).__init__()
         self.layers = nn.ModuleList()
-        current_channels = in_channels  # 记录当前通道数
+        current_channels = in_channels
         
         for _ in range(num_layers):
-            self.layers.append(DenseLayer(current_channels, growth_rate))
-            current_channels += growth_rate  # 每层增加 growth_rate 个通道
+            self.layers.append(A(current_channels, growth_rate))
+            current_channels += growth_rate
         
-        # 使用 1x1 卷积降维到目标通道数
         self.conv1x1 = nn.Conv2d(current_channels, out_channels, kernel_size=1, bias=True)
         self.bn = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
         for layer in self.layers:
-            x = layer(x)  # 逐层拼接
-        x = self.conv1x1(x)  # 1x1 降维
-        x = F.relu(self.bn(x))  # BN + ReLU
+            x = layer(x) 
+        x = self.conv1x1(x)  
+        x = F.relu(self.bn(x))
         return x
 
 class CrossEncoderFusion(nn.Module):
@@ -751,7 +748,7 @@ class CrossEncoderFusion(nn.Module):
         super(CrossEncoderFusion, self).__init__()
         
         self.fusion_blocks = nn.ModuleList([
-            DenseBlock(num_layers, in_channels, growth_rate, out_channels) 
+            B(num_layers, in_channels, growth_rate, out_channels) 
             for in_channels, growth_rate, num_layers, out_channels in fusion_out_channels
         ])
 
