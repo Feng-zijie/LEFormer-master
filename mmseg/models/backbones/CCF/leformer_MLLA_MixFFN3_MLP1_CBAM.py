@@ -19,13 +19,10 @@ from mmcv.runner import BaseModule, ModuleList, Sequential
 
 from ..builder import BACKBONES
 from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
-from ..utils import make_laplace
-
 
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
-
 
 class DepthWiseConvModule(BaseModule):
     """An implementation of one Depth-wise Conv Module of LEFormer.
@@ -377,97 +374,90 @@ class MLLA(nn.Module):
             
         return x
 
+class ChannelAttentionModule(BaseModule):
+    """An implementation of one Channel Attention Module of LEFormer.
 
-class ChannelGate(nn.Module):
-    def __init__(self, gate_channels, reduction_ratio=16):
-        super(ChannelGate, self).__init__()
-        self.gate_channels = gate_channels
-        self.mlp = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(gate_channels, gate_channels // reduction_ratio),
+        Args:
+            embed_dims (int): The embedding dimension.
+    """
+
+    def __init__(self, embed_dims):
+        super(ChannelAttentionModule, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.shared_MLP = nn.Sequential(
+            Conv2d(embed_dims, embed_dims // 4, 1, bias=False),
             nn.ReLU(),
-            nn.Linear(gate_channels // reduction_ratio, gate_channels)
+            Conv2d(embed_dims // 4, embed_dims, 1, bias=False)
         )
 
-    def forward(self, x):
-        avg_out = self.mlp(F.avg_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))).unsqueeze(-1).unsqueeze(-1)
-        max_out = self.mlp(F.max_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))).unsqueeze(-1).unsqueeze(-1)
-        channel_att_sum = avg_out + max_out
-
-        scale = torch.sigmoid(channel_att_sum).expand_as(x)
-        return x * scale
-
-
-
-class SpatialGate(nn.Module):
-    def __init__(self):
-        super(SpatialGate, self).__init__()
-        kernel_size = 7
-        self.spatial = nn.Conv2d(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x_compress = torch.cat((torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
-        x_out = self.spatial(x_compress)
-        scale = torch.sigmoid(x_out)  # broadcasting
-        return x * scale
+        avg_out = self.shared_MLP(self.avg_pool(x))
+        max_out = self.shared_MLP(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
 
 
-class CBAM(nn.Module):
-    def __init__(self, gate_channels, reduction_ratio=16):
-        super(CBAM, self).__init__()
-        self.ChannelGate = ChannelGate(gate_channels, reduction_ratio)
-        self.SpatialGate = SpatialGate()
+class SpatialAttentionModule(BaseModule):
+    """An implementation of one Spatial Attention Module of LEFormer.
+
+        Args:
+            kernel_size (int): The kernel size of Conv2d. Default: 3.
+    """
+
+    def __init__(self, kernel_size=3):
+        super(SpatialAttentionModule, self).__init__()
+
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x_out = self.ChannelGate(x)
-        x_out = self.SpatialGate(x_out)
-        return x_out
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
 
 
-# Edge-Guided Attention Module
-class EGA(nn.Module):
-    def __init__(self, in_channels):
-        super(EGA, self).__init__()
+class MultiscaleCBAMLayer(BaseModule):
+    """An implementation of Multiscale CBAM layer of LEFormer.
 
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(in_channels * 3, in_channels, 3, 1, 1),
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True))
+        Args:
+            embed_dims (int): The feature dimension.
+            kernel_size (int): The kernel size of Conv2d. Default: 7.
+        """
 
-        self.attention = nn.Sequential(
-            nn.Conv2d(in_channels, 1, 3, 1, 1),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid())
+    def __init__(self, embed_dims, kernel_size=7):
+        super(MultiscaleCBAMLayer, self).__init__()
+        self.channel_attention = ChannelAttentionModule(embed_dims // 4)
+        self.spatial_attention = SpatialAttentionModule(kernel_size)
+        self.multiscale_conv = nn.ModuleList()
+        for i in range(1, 5):
+            self.multiscale_conv.append(
+                Conv2d(
+                    in_channels=embed_dims // 4,
+                    out_channels=embed_dims // 4,
+                    kernel_size=3,
+                    stride=1,
+                    padding=(2 * i + 1) // 2,
+                    bias=True,
+                    dilation=(2 * i + 1) // 2)
+            )
 
-        self.cbam = CBAM(in_channels)
-        self.pred_conv = nn.Conv2d(in_channels, 1, kernel_size=3, stride=1, padding=1)  # 用于生成 pred
-
-    def forward(self, edge_feature, x):
-        residual = x
-        xsize = x.size()[2:]
-
-        pred = torch.sigmoid(self.pred_conv(x))
-
-        # reverse attention
-        background_att = 1 - pred
-        background_x = x * background_att
-
-        # boudary attention
-        edge_pred = make_laplace(pred, 1)
-        pred_feature = x * edge_pred
-
-        # high-frequency feature
-        edge_input = F.interpolate(edge_feature, size=xsize, mode='bilinear', align_corners=True)
-        input_feature = x * edge_input
-
-        fusion_feature = torch.cat([background_x, pred_feature, input_feature], dim=1)
-        fusion_feature = self.fusion_conv(fusion_feature)
-
-        attention_map = self.attention(fusion_feature)
-        fusion_feature = fusion_feature * attention_map
-
-        out = fusion_feature + residual
-        out = self.cbam(out)
+    def forward(self, x):
+        outs = torch.split(x, x.shape[1] // 4, dim=1)
+        out_list = []
+        for (i, out) in enumerate(outs):
+            out = self.multiscale_conv[i](out)
+            out = self.channel_attention(out) * out
+            out_list.append(out)
+        out = torch.cat(out_list, dim=1)
+        out = self.spatial_attention(out) * out
         return out
 
 class CnnEncoderLayer(BaseModule):
@@ -516,8 +506,7 @@ class CnnEncoderLayer(BaseModule):
                                           ffn_drop=ffn_drop)
 
         self.norm = nn.BatchNorm2d(output_channels)
-        
-        self.ega_block = EGA(output_channels)
+        self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
 
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
@@ -542,8 +531,7 @@ class CnnEncoderLayer(BaseModule):
         
         
         # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
-        edge_feature = make_laplace(out, channels=self.output_channels)
-        out = self.ega_block(edge_feature,out)
+        out = self.multiscale_cbam(out)
 
         _, _, H, W=out.shape
 

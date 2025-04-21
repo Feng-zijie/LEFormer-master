@@ -12,9 +12,12 @@ from .up_conv_block import UpConvBlock
 
 from .KAN import KANLinear
 
+from .EGA_methods import make_laplace, make_laplace_pyramid, gauss_kernel,downsample, upsample, conv_gauss
+
 __all__ = [
     'ResLayer', 'SelfAttentionBlock', 'make_divisible', 'InvertedResidual',
     'UpConvBlock', 'InvertedResidualV3', 'SELayer', 'PatchEmbed',
     'nchw_to_nlc', 'nlc_to_nchw', 'nchw2nlc2nchw', 'nlc2nchw2nlc',
-    "KANLinear"
+    "KANLinear",
+    'make_laplace', 'make_laplace_pyramid', 'gauss_kernel', 'downsample','upsample', 'conv_gauss'
 ]

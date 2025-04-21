@@ -14,7 +14,7 @@ model = dict(
         # num_heads=[1, 2, 5, 6],
 
         # 原始的层数
-        num_layers=[2, 2, 2, 3],
+        num_layers=[2, 2, 3, 6],
         num_heads=[1, 2, 5, 6],
 
         patch_sizes=[7, 3, 3, 3],
@@ -22,11 +22,8 @@ model = dict(
         sr_ratios=[8, 4, 2, 1],
         out_indices=(0, 1, 2, 3),
         mlp_ratio=4,
-        qkv_bias=True,
         drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.1,
-        pool_numbers=1),
+        ffn_classes=3),
     decode_head=dict(
         type='SegformerHead',
         in_channels=[32, 64, 160, 192],
