@@ -45,7 +45,7 @@ def parse_args():
     group_gpus.add_argument(
         '--gpu-ids',
         type=int,
-        default=[0],
+        default=[5],
         nargs='+',
         help='(Deprecated, please use --gpu-id) ids of gpus to use '
              '(only applicable to non-distributed training)')
@@ -214,7 +214,11 @@ def main():
             'avoid this error.')
         model = revert_sync_batchnorm(model)
 
+    
     logger.info(model)
+    
+    
+    
 
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:
