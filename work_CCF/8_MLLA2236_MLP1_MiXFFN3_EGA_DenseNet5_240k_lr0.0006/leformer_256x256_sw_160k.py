@@ -7,18 +7,15 @@ model = dict(
         in_channels=3,
         embed_dims=32,
         num_stages=4,
-        num_layers=[2, 2, 2, 3],
+        num_layers=[2, 2, 3, 6],
         num_heads=[1, 2, 5, 6],
         patch_sizes=[7, 3, 3, 3],
         strides=[4, 2, 2, 2],
         sr_ratios=[8, 4, 2, 1],
         out_indices=(0, 1, 2, 3),
         mlp_ratio=4,
-        qkv_bias=True,
         drop_rate=0.0,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.1,
-        pool_numbers=1),
+        ffn_classes=3),
     decode_head=dict(
         type='SegformerHead',
         in_channels=[32, 64, 160, 192],
@@ -160,7 +157,7 @@ workflow = [('train', 1)]
 cudnn_benchmark = True
 optimizer = dict(
     type='AdamW',
-    lr=0.0005,
+    lr=0.0006,
     betas=(0.9, 0.999),
     weight_decay=0.05,
     paramwise_cfg=dict(
@@ -177,9 +174,9 @@ lr_config = dict(
     power=1.0,
     min_lr=0.0,
     by_epoch=False)
-runner = dict(type='IterBasedRunner', max_iters=200000)
+runner = dict(type='IterBasedRunner', max_iters=240000)
 checkpoint_config = dict(by_epoch=False, interval=20000)
-evaluation = dict(interval=20000, metric='mIoU', pre_eval=True)
-work_dir = './work_CCF/4_效果最好_DenseNet_3'
-gpu_ids = [7]
+evaluation = dict(interval=20000, metric=['mIoU', 'mFscore'], pre_eval=True)
+work_dir = './work_CCF/8_MLLA2236_MLP1_MiXFFN3_EGA_DenseNet5_240k_lr0.0006'
+gpu_ids = [2]
 auto_resume = False

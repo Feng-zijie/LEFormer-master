@@ -424,78 +424,109 @@ class CBAM(nn.Module):
         x_out = self.SpatialGate(x_out)
         return x_out
 
+# MDFA的空间和通道注意力模块
+class tongdao(nn.Module):  #处理通道部分   函数名就是拼音名称
+    # 通道模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 自适应平均池化，输出大小为1x1
+        self.fc = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于降维
+        self.relu = nn.ReLU(inplace=False)  # ReLU激活函数，就地操作以节省内存
 
-class GGCA(nn.Module):  # (Global Grouped Coordinate Attention) 全局分组坐标注意力
-    def __init__(self, channel, h, w, reduction=16, num_groups=4):
-        super(GGCA, self).__init__()
-        self.num_groups = num_groups  # 分组数
-        assert channel % num_groups == 0, "The number of channels must be divisible by the number of groups."
-        self.group_channels = channel // num_groups  # 每组的通道数
-        self.h = h  # 高度方向的特定尺寸
-        self.w = w  # 宽度方向的特定尺寸
+    # 前向传播函数
+    def forward(self, x):
+        b, c, _, _ = x.size()  # 提取批次大小和通道数
+        y = self.avg_pool(x)  # 应用自适应平均池化
+        y = self.fc(y)  # 应用1x1卷积
+        y = self.relu(y)  # 应用ReLU激活
+        y = nn.functional.interpolate(y, size=(x.size(2), x.size(3)), mode='nearest')  # 调整y的大小以匹配x的空间维度
+        return x * y.expand_as(x)  # 将计算得到的通道权重应用到输入x上，实现特征重校准
 
-        # 确保降维后的通道数至少为 1
-        reduced_channels = max(self.group_channels // reduction, 1)
+class kongjian(nn.Module):
+    # 空间模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.Conv1x1 = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于产生空间激励
+        self.norm = nn.Sigmoid()  # Sigmoid函数用于归一化
 
-        # 定义H方向的全局平均池化和最大池化
-        self.avg_pool_h = nn.AdaptiveAvgPool2d((h, 1))  # 输出大小为(h, 1)
-        self.max_pool_h = nn.AdaptiveMaxPool2d((h, 1))
-        # 定义W方向的全局平均池化和最大池化
-        self.avg_pool_w = nn.AdaptiveAvgPool2d((1, w))  # 输出大小为(1, w)
-        self.max_pool_w = nn.AdaptiveMaxPool2d((1, w))
+    # 前向传播函数
+    def forward(self, x):
+        y = self.Conv1x1(x)  # 应用1x1卷积
+        y = self.norm(y)  # 应用Sigmoid函数
+        return x * y  # 将空间权重应用到输入x上，实现空间激励
 
-        # 定义共享的卷积层，用于通道间的降维和恢复
-        self.shared_conv = nn.Sequential(
-            nn.Conv2d(in_channels=self.group_channels, out_channels=reduced_channels, kernel_size=(1, 1)),
-            nn.BatchNorm2d(reduced_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=reduced_channels, out_channels=self.group_channels, kernel_size=(1, 1))
+class hebing(nn.Module):    #函数名为合并, 意思是把空间和通道分别提取的特征合并起来
+    # 合并模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.tongdao = tongdao(in_channel)  # 创建通道子模块
+        self.kongjian = kongjian(in_channel)  # 创建空间子模块
+
+    # 前向传播函数
+    def forward(self, U):
+        U_kongjian = self.kongjian(U)  # 通过空间模块处理输入U
+        U_tongdao = self.tongdao(U)  # 通过通道模块处理输入U
+        return torch.max(U_tongdao, U_kongjian)  # 取两者的逐元素最大值，结合通道和空间激励
+
+
+# 修改所有 ReLU 的 inplace 参数为 False
+class MDFA(nn.Module):  # 多尺度空洞融合注意力模块
+    def __init__(self, dim_in, dim_out, rate=1, bn_mom=0.1):
+        super(MDFA, self).__init__()
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 1, 1, padding=0, dilation=rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
         )
-        # 定义sigmoid激活函数
-        self.sigmoid_h = nn.Sigmoid()
-        self.sigmoid_w = nn.Sigmoid()
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=6 * rate, dilation=6 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=12 * rate, dilation=12 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch4 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=18 * rate, dilation=18 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch5_conv = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=True)
+        self.branch5_bn = nn.BatchNorm2d(dim_out, momentum=bn_mom)
+        self.branch5_relu = nn.ReLU(inplace=False)  
+
+        self.conv_cat = nn.Sequential(
+            nn.Conv2d(dim_out * 5, dim_out, 1, 1, padding=0, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False),
+        )
+        self.Hebing = hebing(in_channel=dim_out * 5)
 
     def forward(self, x):
-        batch_size, channel, height, width = x.size()
-        # 确保通道数可以被分组数整除
-        assert channel % self.num_groups == 0, "The number of channels must be divisible by the number of groups."
-
-        # 将输入特征图按通道数分组
-        x = x.view(batch_size, self.num_groups, self.group_channels, height, width)
-
-        # 分别在H方向进行全局平均池化和最大池化
-        x_h_avg = self.avg_pool_h(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, self.h, 1)
-        x_h_max = self.max_pool_h(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, self.h, 1)
-
-        # 分别在W方向进行全局平均池化和最大池化
-        x_w_avg = self.avg_pool_w(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, 1, self.w)
-        x_w_max = self.max_pool_w(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, 1, self.w)
-
-        # 应用共享卷积层进行特征处理
-        y_h_avg = self.shared_conv(x_h_avg.view(batch_size * self.num_groups, self.group_channels, self.h, 1))
-        y_h_max = self.shared_conv(x_h_max.view(batch_size * self.num_groups, self.group_channels, self.h, 1))
-
-        y_w_avg = self.shared_conv(x_w_avg.view(batch_size * self.num_groups, self.group_channels, 1, self.w))
-        y_w_max = self.shared_conv(x_w_max.view(batch_size * self.num_groups, self.group_channels, 1, self.w))
-
-        # 计算注意力权重
-        att_h = self.sigmoid_h(y_h_avg + y_h_max).view(batch_size, self.num_groups, self.group_channels, self.h, 1)
-        att_w = self.sigmoid_w(y_w_avg + y_w_max).view(batch_size, self.num_groups, self.group_channels, 1, self.w)
-
-        # 应用注意力权重
-        out = x * att_h * att_w
-        out = out.view(batch_size, channel, height, width)
-
-        return out
+        [b, c, row, col] = x.size()
+        conv1x1 = self.branch1(x)
+        conv3x3_1 = self.branch2(x)
+        conv3x3_2 = self.branch3(x)
+        conv3x3_3 = self.branch4(x)
+        global_feature = torch.mean(x, 2, True)
+        global_feature = torch.mean(global_feature, 3, True)
+        global_feature = self.branch5_conv(global_feature)
+        global_feature = self.branch5_bn(global_feature)
+        global_feature = self.branch5_relu(global_feature)
+        global_feature = F.interpolate(global_feature, (row, col), None, 'bilinear', True)
+        feature_cat = torch.cat([conv1x1, conv3x3_1, conv3x3_2, conv3x3_3, global_feature], dim=1)
+        larry = self.Hebing(feature_cat)
+        larry_feature_cat = larry * feature_cat
+        result = self.conv_cat(larry_feature_cat)
+        return result
 
 # Edge-Guided Attention Module
 class EGA(nn.Module):
-    def __init__(self, in_channels,h,w):
+    def __init__(self, in_channels):
         super(EGA, self).__init__()
+    
         self.fusion_conv = nn.Sequential(
             nn.Conv2d(in_channels * 3, in_channels, 3, 1, 1),
             nn.BatchNorm2d(in_channels),
@@ -506,7 +537,8 @@ class EGA(nn.Module):
             nn.BatchNorm2d(1),
             nn.Sigmoid())
 
-        self.ggca_block = GGCA(in_channels,h,w)
+        self.cbam = CBAM(in_channels)
+        self.mdfa_block = MDFA(dim_in=in_channels, dim_out=in_channels)
         self.pred_conv = nn.Conv2d(in_channels, 1, kernel_size=3, stride=1, padding=1)  # 用于生成 pred
 
     def forward(self, edge_feature, x):
@@ -534,9 +566,9 @@ class EGA(nn.Module):
         fusion_feature = fusion_feature * attention_map
 
         out = fusion_feature + residual
-        
-        out = self.ggca_block(out)
-        
+              
+        out = self.mdfa_block(out)
+     
         return out
 
 class CnnEncoderLayer(BaseModule):
@@ -566,9 +598,7 @@ class CnnEncoderLayer(BaseModule):
                  padding=0,
                  act_cfg=dict(type='GELU'),
                  ffn_drop=0.,
-                 init_cfg=None,
-                 ggca_shape=None
-            ):
+                 init_cfg=None):
         super(CnnEncoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -588,14 +618,7 @@ class CnnEncoderLayer(BaseModule):
 
         self.norm = nn.BatchNorm2d(output_channels)
         
-        # 使用 ggca_shape 参数初始化 GGCA 模块
-        if ggca_shape is not None:
-            h, w = ggca_shape
-            self.ggca_block = GGCA(output_channels, h, w)
-        else:
-            self.ggca_block = None
-        
-        self.ega_block = EGA(output_channels,h,w)
+        self.ega_block = EGA(output_channels)
 
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
@@ -624,7 +647,7 @@ class CnnEncoderLayer(BaseModule):
         out = self.ega_block(edge_feature,out)
 
         _, _, H, W=out.shape
-        
+
         if H == 64:
             identity = self.residual[0](x)
         elif H == 32:
@@ -638,7 +661,7 @@ class CnnEncoderLayer(BaseModule):
             print(f"mismatch: identity={identity.shape}, out={out.shape}")
             identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
 
-        out += identity
+        out = out + identity
         out = F.relu(out)
         return out
 
@@ -885,14 +908,7 @@ class LEFormer(BaseModule):
             cur += num_layer
 
         self.cnn_encoder_layers = nn.ModuleList()
-        
-        GGCA_shape=[
-            (64,64),
-            (32,32),
-            (16,16),
-            (8,8)
-        ]
-        
+
         for i in range(num_stages):
             self.cnn_encoder_layers.append(
                 CnnEncoderLayer(
@@ -902,8 +918,7 @@ class LEFormer(BaseModule):
                     kernel_size=patch_sizes[i],
                     stride=strides[i],
                     padding=patch_sizes[i] // 2,
-                    ffn_drop=drop_rate,
-                    ggca_shape=GGCA_shape[i]
+                    ffn_drop=drop_rate
                 )
             )
 

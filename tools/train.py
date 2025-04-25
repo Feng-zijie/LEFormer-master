@@ -45,7 +45,7 @@ def parse_args():
     group_gpus.add_argument(
         '--gpu-ids',
         type=int,
-        default=[5],
+        default=[1],
         nargs='+',
         help='(Deprecated, please use --gpu-id) ids of gpus to use '
              '(only applicable to non-distributed training)')
@@ -217,9 +217,6 @@ def main():
     
     logger.info(model)
     
-    
-    
-
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:
         val_dataset = copy.deepcopy(cfg.data.val)

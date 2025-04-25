@@ -424,78 +424,62 @@ class CBAM(nn.Module):
         x_out = self.SpatialGate(x_out)
         return x_out
 
+# 定义GAM_Attention类
+class GCSA(nn.Module):
+    def __init__(self, in_channels, rate=4):
+        super(GCSA, self).__init__()
 
-class GGCA(nn.Module):  # (Global Grouped Coordinate Attention) 全局分组坐标注意力
-    def __init__(self, channel, h, w, reduction=16, num_groups=4):
-        super(GGCA, self).__init__()
-        self.num_groups = num_groups  # 分组数
-        assert channel % num_groups == 0, "The number of channels must be divisible by the number of groups."
-        self.group_channels = channel // num_groups  # 每组的通道数
-        self.h = h  # 高度方向的特定尺寸
-        self.w = w  # 宽度方向的特定尺寸
-
-        # 确保降维后的通道数至少为 1
-        reduced_channels = max(self.group_channels // reduction, 1)
-
-        # 定义H方向的全局平均池化和最大池化
-        self.avg_pool_h = nn.AdaptiveAvgPool2d((h, 1))  # 输出大小为(h, 1)
-        self.max_pool_h = nn.AdaptiveMaxPool2d((h, 1))
-        # 定义W方向的全局平均池化和最大池化
-        self.avg_pool_w = nn.AdaptiveAvgPool2d((1, w))  # 输出大小为(1, w)
-        self.max_pool_w = nn.AdaptiveMaxPool2d((1, w))
-
-        # 定义共享的卷积层，用于通道间的降维和恢复
-        self.shared_conv = nn.Sequential(
-            nn.Conv2d(in_channels=self.group_channels, out_channels=reduced_channels, kernel_size=(1, 1)),
-            nn.BatchNorm2d(reduced_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=reduced_channels, out_channels=self.group_channels, kernel_size=(1, 1))
+        # 通道注意力子模块
+        self.channel_attention = nn.Sequential(
+            nn.Linear(in_channels, int(in_channels / rate)),  # 线性层，将通道数缩减到1/rate
+            nn.ReLU(inplace=True),  # ReLU激活函数
+            nn.Linear(int(in_channels / rate), in_channels)  # 线性层，将通道数恢复到原始大小
         )
-        # 定义sigmoid激活函数
-        self.sigmoid_h = nn.Sigmoid()
-        self.sigmoid_w = nn.Sigmoid()
 
+        # 空间注意力子模块
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(in_channels, int(in_channels / rate), kernel_size=7, padding=3),  # 7x7卷积，通道数缩减到1/rate
+            nn.BatchNorm2d(int(in_channels / rate)),  # 批归一化
+            nn.ReLU(inplace=True),  # ReLU激活函数
+            nn.Conv2d(int(in_channels / rate), in_channels, kernel_size=7, padding=3),  # 7x7卷积，恢复到原始通道数
+            nn.BatchNorm2d(in_channels)  # 批归一化
+        )
+
+    # 通道洗牌操作函数
+    def channel_shuffle(self, x, groups):
+        batchsize, num_channels, height, width = x.size()
+        channels_per_group = num_channels // groups
+        # 调整形状，分组
+        x = x.view(batchsize, groups, channels_per_group, height, width)
+        # 转置，打乱组内通道
+        x = torch.transpose(x, 1, 2).contiguous()
+        # 恢复原始形状
+        x = x.view(batchsize, -1, height, width)
+
+        return x
+
+    # 前向传播函数
     def forward(self, x):
-        batch_size, channel, height, width = x.size()
-        # 确保通道数可以被分组数整除
-        assert channel % self.num_groups == 0, "The number of channels must be divisible by the number of groups."
+        b, c, h, w = x.shape  # 获取输入张量的形状
+        x_permute = x.permute(0, 2, 3, 1).view(b, -1, c)  # 调整形状，便于通道注意力操作
+        x_att_permute = self.channel_attention(x_permute).view(b, h, w, c)  # 应用通道注意力
+        x_channel_att = x_att_permute.permute(0, 3, 1, 2).sigmoid()  # 调整回原始形状，并应用Sigmoid激活函数
 
-        # 将输入特征图按通道数分组
-        x = x.view(batch_size, self.num_groups, self.group_channels, height, width)
+        x = x * x_channel_att  # 将输入特征图与通道注意力图逐元素相乘
 
-        # 分别在H方向进行全局平均池化和最大池化
-        x_h_avg = self.avg_pool_h(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, self.h, 1)
-        x_h_max = self.max_pool_h(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, self.h, 1)
+        x = self.channel_shuffle(x, groups=4) # 添加通道洗牌操作[根据自己的任务设定组数,2也行,大于4也行，看效果选择]
 
-        # 分别在W方向进行全局平均池化和最大池化
-        x_w_avg = self.avg_pool_w(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, 1, self.w)
-        x_w_max = self.max_pool_w(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, 1, self.w)
+        x_spatial_att = self.spatial_attention(x).sigmoid()  # 应用空间注意力，并应用Sigmoid激活函数
 
-        # 应用共享卷积层进行特征处理
-        y_h_avg = self.shared_conv(x_h_avg.view(batch_size * self.num_groups, self.group_channels, self.h, 1))
-        y_h_max = self.shared_conv(x_h_max.view(batch_size * self.num_groups, self.group_channels, self.h, 1))
+        out = x * x_spatial_att  # 将输入特征图与空间注意力图逐元素相乘
 
-        y_w_avg = self.shared_conv(x_w_avg.view(batch_size * self.num_groups, self.group_channels, 1, self.w))
-        y_w_max = self.shared_conv(x_w_max.view(batch_size * self.num_groups, self.group_channels, 1, self.w))
-
-        # 计算注意力权重
-        att_h = self.sigmoid_h(y_h_avg + y_h_max).view(batch_size, self.num_groups, self.group_channels, self.h, 1)
-        att_w = self.sigmoid_w(y_w_avg + y_w_max).view(batch_size, self.num_groups, self.group_channels, 1, self.w)
-
-        # 应用注意力权重
-        out = x * att_h * att_w
-        out = out.view(batch_size, channel, height, width)
-
-        return out
+        return out  # 返回输出特征图
 
 # Edge-Guided Attention Module
 class EGA(nn.Module):
-    def __init__(self, in_channels,h,w):
+    def __init__(self, in_channels):
         super(EGA, self).__init__()
+
         self.fusion_conv = nn.Sequential(
             nn.Conv2d(in_channels * 3, in_channels, 3, 1, 1),
             nn.BatchNorm2d(in_channels),
@@ -506,7 +490,8 @@ class EGA(nn.Module):
             nn.BatchNorm2d(1),
             nn.Sigmoid())
 
-        self.ggca_block = GGCA(in_channels,h,w)
+        self.cbam = CBAM(in_channels)
+        self.gcsa_block=GCSA(in_channels=in_channels)
         self.pred_conv = nn.Conv2d(in_channels, 1, kernel_size=3, stride=1, padding=1)  # 用于生成 pred
 
     def forward(self, edge_feature, x):
@@ -534,10 +519,12 @@ class EGA(nn.Module):
         fusion_feature = fusion_feature * attention_map
 
         out = fusion_feature + residual
-        
-        out = self.ggca_block(out)
-        
+        out = self.gcsa_block(out)
         return out
+
+
+
+
 
 class CnnEncoderLayer(BaseModule):
     """Implements one cnn encoder layer in LEFormer.
@@ -566,9 +553,7 @@ class CnnEncoderLayer(BaseModule):
                  padding=0,
                  act_cfg=dict(type='GELU'),
                  ffn_drop=0.,
-                 init_cfg=None,
-                 ggca_shape=None
-            ):
+                 init_cfg=None):
         super(CnnEncoderLayer, self).__init__(init_cfg)
 
         self.embed_dims = embed_dims
@@ -588,14 +573,7 @@ class CnnEncoderLayer(BaseModule):
 
         self.norm = nn.BatchNorm2d(output_channels)
         
-        # 使用 ggca_shape 参数初始化 GGCA 模块
-        if ggca_shape is not None:
-            h, w = ggca_shape
-            self.ggca_block = GGCA(output_channels, h, w)
-        else:
-            self.ggca_block = None
-        
-        self.ega_block = EGA(output_channels,h,w)
+        self.ega_block = EGA(output_channels)
 
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
@@ -624,7 +602,7 @@ class CnnEncoderLayer(BaseModule):
         out = self.ega_block(edge_feature,out)
 
         _, _, H, W=out.shape
-        
+
         if H == 64:
             identity = self.residual[0](x)
         elif H == 32:
@@ -885,14 +863,7 @@ class LEFormer(BaseModule):
             cur += num_layer
 
         self.cnn_encoder_layers = nn.ModuleList()
-        
-        GGCA_shape=[
-            (64,64),
-            (32,32),
-            (16,16),
-            (8,8)
-        ]
-        
+
         for i in range(num_stages):
             self.cnn_encoder_layers.append(
                 CnnEncoderLayer(
@@ -902,8 +873,7 @@ class LEFormer(BaseModule):
                     kernel_size=patch_sizes[i],
                     stride=strides[i],
                     padding=patch_sizes[i] // 2,
-                    ffn_drop=drop_rate,
-                    ggca_shape=GGCA_shape[i]
+                    ffn_drop=drop_rate
                 )
             )
 
