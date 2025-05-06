@@ -177,6 +177,6 @@ lr_config = dict(
 runner = dict(type='IterBasedRunner', max_iters=240000)
 checkpoint_config = dict(by_epoch=False, interval=20000)
 evaluation = dict(interval=20000, metric=['mIoU', 'mFscore'], pre_eval=True)
-work_dir = './work_CCF/10_9的基础上修改EGA中的CBAM_GCSA'
-gpu_ids = [1]
+work_dir = './work_CCF/12_9的基础上修改EGA中的CBAM_MDFA'
+gpu_ids = [2]
 auto_resume = False

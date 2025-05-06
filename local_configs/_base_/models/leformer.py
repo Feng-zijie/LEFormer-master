@@ -9,12 +9,10 @@ model = dict(
         embed_dims=32,
         num_stages=4,
 
-        # work_dirs/10_DenseNet_layer*4_layers+heads
-        # num_layers=[3, 3, 3, 4],
-        # num_heads=[1, 2, 5, 6],
-
-        # 原始的层数
-        num_layers=[2, 2, 3, 6],
+        # √的层数
+        # num_layers=[2, 2, 3, 6],
+        
+        num_layers=[1, 1, 1, 1],
         num_heads=[1, 2, 5, 6],
 
         patch_sizes=[7, 3, 3, 3],

@@ -31,15 +31,4 @@ lr_config = dict(
     min_lr=0.0,
     by_epoch=False)
 
-# ##  work_dirs/9_DenseNet_layer*4_lr_config   work_dirs/18 ,19 ,20
-# lr_config = dict(
-#     _delete_=True,
-#     policy='poly',
-#     warmup='linear',
-#     warmup_iters=1000,
-#     warmup_ratio=1e-5,
-#     power=1.0,
-#     min_lr=0.0,
-#     by_epoch=False)
-
 data = dict(samples_per_gpu=16, workers_per_gpu=4)

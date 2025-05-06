@@ -29,14 +29,14 @@ model = dict(
             type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0)),
     train_cfg=dict(),
     test_cfg=dict(mode='whole'))
-dataset_type = 'SurfaceWaterDataset'
-data_root = '/home/wangzhecheng/Fengzijie/dataset_splited_SW'
+dataset_type = 'QTPLDataset'
+data_root = '/home/wangzhecheng/Fengzijie/dataset_splited_QTPL'
 img_norm_cfg = dict(
     mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 crop_size = (256, 256)
 train_pipeline = [
     dict(type='LoadImageFromFile'),
-    dict(type='LoadAnnotations'),
+    dict(type='LoadAnnotations', reduce_zero_label=False),
     dict(type='Resize', img_scale=(256, 256), ratio_range=(0.5, 2.0)),
     dict(type='RandomCrop', crop_size=(256, 256), cat_max_ratio=0.75),
     dict(type='RandomFlip', prob=0.5),
@@ -75,13 +75,13 @@ data = dict(
         type='RepeatDataset',
         times=50,
         dataset=dict(
-            type='SurfaceWaterDataset',
-            data_root='/home/wangzhecheng/Fengzijie/dataset_splited_SW',
+            type='QTPLDataset',
+            data_root='/home/wangzhecheng/Fengzijie/dataset_splited_QTPL',
             img_dir='images/training',
             ann_dir='binary_annotations/training',
             pipeline=[
                 dict(type='LoadImageFromFile'),
-                dict(type='LoadAnnotations'),
+                dict(type='LoadAnnotations', reduce_zero_label=False),
                 dict(
                     type='Resize',
                     img_scale=(256, 256),
@@ -102,8 +102,8 @@ data = dict(
                 dict(type='Collect', keys=['img', 'gt_semantic_seg'])
             ])),
     val=dict(
-        type='SurfaceWaterDataset',
-        data_root='/home/wangzhecheng/Fengzijie/dataset_splited_SW',
+        type='QTPLDataset',
+        data_root='/home/wangzhecheng/Fengzijie/dataset_splited_QTPL',
         img_dir='images/validation',
         ann_dir='binary_annotations/validation',
         pipeline=[
@@ -125,8 +125,8 @@ data = dict(
                 ])
         ]),
     test=dict(
-        type='SurfaceWaterDataset',
-        data_root='/home/wangzhecheng/Fengzijie/dataset_splited_SW',
+        type='QTPLDataset',
+        data_root='/home/wangzhecheng/Fengzijie/dataset_splited_QTPL',
         img_dir='images/validation',
         ann_dir='binary_annotations/validation',
         pipeline=[
@@ -177,6 +177,6 @@ lr_config = dict(
 runner = dict(type='IterBasedRunner', max_iters=240000)
 checkpoint_config = dict(by_epoch=False, interval=20000)
 evaluation = dict(interval=20000, metric=['mIoU', 'mFscore'], pre_eval=True)
-work_dir = './work_CCF/10_9的基础上修改EGA中的CBAM_GCSA'
+work_dir = './work_CCF/消融实验/qtpl/1_去掉DenseNet'
 gpu_ids = [1]
 auto_resume = False

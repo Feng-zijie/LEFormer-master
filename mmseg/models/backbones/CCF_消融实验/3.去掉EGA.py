@@ -1,13 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import math
 import warnings
+warnings.filterwarnings("ignore")
 from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
 import torch.nn.functional as F
-from typing import Sequence
+from typing import Sequence, Optional, Callable
 from mmcv.cnn import Conv2d
 from mmcv.cnn.bricks.drop import build_dropout
 from mmcv.cnn.bricks.transformer import MultiheadAttention
@@ -18,6 +19,12 @@ from mmcv.runner import BaseModule, ModuleList, Sequential
 
 from ..builder import BACKBONES
 from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
+from ..utils import make_laplace
+
+
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
+from einops import rearrange, repeat
 
 
 class DepthWiseConvModule(BaseModule):
@@ -94,6 +101,77 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
+
+class MixFFN(BaseModule):
+    """An implementation of MixFFN of LEFormer.
+
+    The differences between MixFFN & FFN:
+        1. Use 1X1 Conv to replace Linear layer.
+        2. Introduce 3X3 Conv to encode positional information.
+    Args:
+        embed_dims (int): The feature dimension. Same as
+            `MultiheadAttention`. Defaults: 256.
+        feedforward_channels (int): The hidden dimension of FFNs.
+            Defaults: 1024.
+        act_cfg (dict, optional): The activation config for FFNs.
+            Default: dict(type='ReLU')
+        ffn_drop (float, optional): Probability of an element to be
+            zeroed in FFN. Default: 0.0.
+        dropout_layer (obj:`ConfigDict`): The dropout_layer used
+            when adding the shortcut.
+        init_cfg (obj:`mmcv.ConfigDict`): The Config for initialization.
+            Default: None.
+    """
+
+    def __init__(self,
+                 embed_dims,
+                 feedforward_channels,
+                 act_cfg=dict(type='GELU'),
+                 ffn_drop=0.,
+                 dropout_layer=None,
+                 init_cfg=None):
+        super(MixFFN, self).__init__(init_cfg)
+
+        self.embed_dims = embed_dims
+        self.feedforward_channels = feedforward_channels
+        self.act_cfg = act_cfg
+        self.activate = build_activation_layer(act_cfg)
+
+        in_channels = embed_dims
+        fc1 = Conv2d(
+            in_channels=in_channels,
+            out_channels=feedforward_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True)
+        # 3x3 depth wise conv to provide positional encode information
+        pe_conv = Conv2d(
+            in_channels=feedforward_channels,
+            out_channels=feedforward_channels,
+            kernel_size=3,
+            stride=1,
+            padding=(3 - 1) // 2,
+            bias=True,
+            groups=feedforward_channels)
+        fc2 = Conv2d(
+            in_channels=feedforward_channels,
+            out_channels=in_channels,
+            kernel_size=1,
+            stride=1,
+            bias=True)
+        drop = nn.Dropout(ffn_drop)
+        layers = [fc1, pe_conv, self.activate, drop, fc2, drop]
+        self.layers = Sequential(*layers)
+        self.dropout_layer = build_dropout(
+            dropout_layer) if dropout_layer else torch.nn.Identity()
+
+    def forward(self, x, hw_shape, identity=None):
+        out = nlc_to_nchw(x, hw_shape)
+        out = self.layers(out)
+        out = nchw_to_nlc(out)
+        if identity is None:
+            identity = x
+        return identity + self.dropout_layer(out)
     
 class RoPE(torch.nn.Module):
     r"""Rotary Positional Embedding.
@@ -176,8 +254,59 @@ class LinearAttention(nn.Module):
     def extra_repr(self) -> str:
         return f'dim={self.dim}, num_heads={self.num_heads}'
     
-    
 class MLLABlock(nn.Module):
+    r""" MLLA Block.
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resolution.
+        num_heads (int): Number of attention heads.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        drop (float, optional): Dropout rate. Default: 0.0
+        drop_path (float, optional): Stochastic depth rate. Default: 0.0
+        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+    """
+
+    def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, **kwargs):
+        super().__init__()
+        
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+
+        self.norm1 = norm_layer(dim)
+        self.in_proj = nn.Linear(dim, dim)
+        self.act_proj = nn.Linear(dim, dim)
+        self.dwc = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        self.act = nn.SiLU()
+        self.attn = LinearAttention(dim=dim, input_resolution=input_resolution, num_heads=num_heads, qkv_bias=qkv_bias)
+        self.out_proj = nn.Linear(dim, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.cpe2 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+
+    def forward(self, x, shortcut):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+
+        act_res = self.act(self.act_proj(x))
+        x = self.in_proj(x).view(B, H, W, C)
+        x = self.act(self.dwc(x.permute(0, 3, 1, 2))).permute(0, 2, 3, 1).view(B, L, C)
+
+        # Linear Attention
+        x = self.attn(x)
+
+        x = self.out_proj(x * act_res)
+        x = shortcut + self.drop_path(x)
+        x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+
+        return x
+    
+    
+class MLLA(nn.Module):
     r""" MLLA Block.
     Args:
         dim (int): Number of input channels.
@@ -191,45 +320,63 @@ class MLLABlock(nn.Module):
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
     def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, **kwargs):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm , classes=False,**kwargs):
         super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.mlp_ratio = mlp_ratio
-        self.cpe1 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        
+        self.mlla_block = MLLABlock(
+            dim=dim,
+            input_resolution=input_resolution,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            drop=drop,
+            drop_path=drop_path,
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+            **kwargs
+        )
+        
+        self.classes = classes
+        self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
         self.norm1 = norm_layer(dim)
-        self.in_proj = nn.Linear(dim, dim)
-        self.act_proj = nn.Linear(dim, dim)
-        self.dwc = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.act = nn.SiLU()
-        self.attn = LinearAttention(dim=dim, input_resolution=input_resolution, num_heads=num_heads, qkv_bias=qkv_bias)
-        self.out_proj = nn.Linear(dim, dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.cpe2 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        
+        if self.classes:
+            self.mlp = Mlp(
+                in_features=dim, 
+                hidden_features=int(dim * mlp_ratio), 
+                act_layer=act_layer, 
+                drop=drop
+            )
+        else :
+            self.mix_ffn = MixFFN(
+                embed_dims=dim,
+                feedforward_channels=4 * dim,
+                ffn_drop=drop_path,
+                dropout_layer=dict(type='DropPath', drop_prob=drop_path),
+                act_cfg=dict(type='GELU')
+            )
+
+        
+        
     def forward(self, x):
-        H, W = self.input_resolution
+        H, W = self.mlla_block.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
-        x = x + self.cpe1(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+        x = x + self.cpe(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
         shortcut = x
         x = self.norm1(x)
-        act_res = self.act(self.act_proj(x))
-        x = self.in_proj(x).view(B, H, W, C)
-        x = self.act(self.dwc(x.permute(0, 3, 1, 2))).permute(0, 2, 3, 1).view(B, L, C)
-        # Linear Attention
-        x = self.attn(x)
-        x = self.out_proj(x * act_res)
-        x = shortcut + self.drop_path(x)
-        x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+        
+        x=self.mlla_block(x,shortcut)
+        
         # FFN
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        if self.classes:
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+        else: 
+            x = x + self.drop_path(self.mix_ffn(self.norm2(x),(H,W))) 
+            
         return x
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"mlp_ratio={self.mlp_ratio}"
 
 class CnnEncoderLayer(BaseModule):
     """Implements one cnn encoder layer in LEFormer.
@@ -277,7 +424,7 @@ class CnnEncoderLayer(BaseModule):
                                           ffn_drop=ffn_drop)
 
         self.norm = nn.BatchNorm2d(output_channels)
-
+    
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
             nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),  # 普通残差  
@@ -298,7 +445,7 @@ class CnnEncoderLayer(BaseModule):
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
 
         out = self.layers(x)
-
+        
         _, _, H, W=out.shape
 
         if H == 64:
@@ -314,11 +461,9 @@ class CnnEncoderLayer(BaseModule):
             print(f"mismatch: identity={identity.shape}, out={out.shape}")
             identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
 
-        out += identity
+        out = out + identity
         out = F.relu(out)
         return out
-
-
 
 # cross 变体
 class DenseLayer(nn.Module):
@@ -371,10 +516,12 @@ class CrossEncoderFusion(nn.Module):
         outs = []
         cnn_encoder_out = x
 
+        # 刚来的 x.shape 为 [16, 3, 256, 256]
+
+
         for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(zip(cnn_encoder_layers, transformer_encoder_layers)):
             # CNN 分支
-        
-            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
+            cnn_encoder_out = cnn_encoder_layer(x)
 
             # 经过 Transformer 编码器的每一层 : transformer_encoder_layer[0] -> transformer_encoder_layer[1]
             # 1. torch.Size([16, 4096, 32]) (64, 64)   ->   torch.Size([16, 4096, 32]) (64, 64)
@@ -383,9 +530,11 @@ class CrossEncoderFusion(nn.Module):
             # 4. torch.Size([16, 64, 192]) (8, 8)   ->   torch.Size([16, 64, 192]) (8, 8)
             # Transformer 分支
             x, hw_shape = transformer_encoder_layer[0](x)
-            
+
+
             for block in transformer_encoder_layer[1]:
                 x = block(x)
+                
             x = transformer_encoder_layer[2](x)
             x = nlc_to_nchw(x, hw_shape)
 
@@ -444,21 +593,18 @@ class LEFormer(BaseModule):
     """
 
     def __init__(self,
-                 in_channels=3, # 输入图像的通道数，RGB 图像一般是 3。
+                 in_channels=3, # DDD输入图像的通道数，RGB 图像一般是 3。
                  embed_dims=32, # 基础嵌入维度，用于 Transformer 的输入通道数。
                  num_stages=4, # 总共有 4 个阶段，每个阶段可以有不同的 层。
-                 num_layers=(2, 2, 2, 3), # 每个阶段的 Transformer 层数。
+                 num_layers=(2, 2, 3, 6), # 每个阶段的 Transformer 层数。
                  num_heads=(1, 2, 5, 6), # 每个阶段的 Transformer 多头注意力的头数。
                  patch_sizes=(7, 3, 3, 3), # 每个阶段的 Patch Embedding 卷积核大小。
                  strides=(4, 2, 2, 2), # 每个阶段的 Patch Embedding 步长。
                  sr_ratios=(8, 4, 2, 1), # 每个阶段的 Transformer 编码层的空间缩减率。
                  out_indices=(0, 1, 2, 3), # 注意力缩小比例，用于减少计算量。
                  mlp_ratio=4,  # MLP 隐藏维度与嵌入维度的比例。
-                 qkv_bias=True,
                  drop_rate=0.0,
-                 attn_drop_rate=0.0,
-                 drop_path_rate=0.1,
-                 pool_numbers=1, # 控制使用 PTL 的层数
+                 ffn_classes=1, # 控制使用 MixFFN 的层数
                  act_cfg=dict(type='GELU'),
                  norm_cfg=dict(type='LN', eps=1e-6),
                  pretrained=None,
@@ -492,7 +638,7 @@ class LEFormer(BaseModule):
             (384,128, 2, 192)
         ]
 
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_3)
+        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_5)
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -518,16 +664,11 @@ class LEFormer(BaseModule):
         self.out_indices = out_indices
         assert max(out_indices) < self.num_stages
 
-        dpr = [
-            x.item()
-            for x in torch.linspace(0, drop_path_rate, sum(num_layers))
-        ]  # stochastic num_layer decay rule
-
         cur = 0
         embed_dims_list = []
         feedforward_channels_list = []
         self.transformer_encoder_layers = ModuleList()
-        for i, num_layer in enumerate(num_layers):  # num_layer 是每个阶段的 Transformer 层数
+        for i, num_layer in enumerate(num_layers):  # num_layer 是每个阶段的 MLLA 层数
             embed_dims_i = embed_dims * num_heads[i]
             embed_dims_list.append(embed_dims_i)
             patch_embed = PatchEmbed(
@@ -538,6 +679,7 @@ class LEFormer(BaseModule):
                 padding=patch_sizes[i] // 2,
                 norm_cfg=norm_cfg)
             feedforward_channels_list.append(mlp_ratio * embed_dims_i)
+
             
             if embed_dims_i==32:
                 self.input_resolution=(64,64)
@@ -547,20 +689,21 @@ class LEFormer(BaseModule):
                 self.input_resolution=(16,16)
             elif embed_dims_i==192:
                 self.input_resolution=(8,8)
-            
                 
             layer = ModuleList([
-                MLLABlock(
+                MLLA(
                     dim=embed_dims_i, 
                     input_resolution=self.input_resolution,
-                    num_heads=4
+                    num_heads=4,
+                    classes= i < ffn_classes
                 ) 
                     for idx in range(num_layer)
             ])
-            
+           
             in_channels = embed_dims_i
             # The ret[0] of build_norm_layer is norm name.
             norm = build_norm_layer(norm_cfg, embed_dims_i)[1]
+            
             self.transformer_encoder_layers.append(ModuleList([patch_embed, layer, norm]))
             cur += num_layer
 
@@ -596,10 +739,10 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
-
              return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,
                 transformer_encoder_layers=self.transformer_encoder_layers,
                 out_indices=self.out_indices
             )
+             

@@ -157,7 +157,7 @@ workflow = [('train', 1)]
 cudnn_benchmark = True
 optimizer = dict(
     type='AdamW',
-    lr=0.0005,
+    lr=0.0006,
     betas=(0.9, 0.999),
     weight_decay=0.05,
     paramwise_cfg=dict(
@@ -176,7 +176,7 @@ lr_config = dict(
     by_epoch=False)
 runner = dict(type='IterBasedRunner', max_iters=240000)
 checkpoint_config = dict(by_epoch=False, interval=20000)
-evaluation = dict(interval=20000, metric='mIoU', pre_eval=True)
-work_dir = './work_CCF/100_测试参数量'
-gpu_ids = [5]
+evaluation = dict(interval=20000, metric=['mIoU', 'mFscore'], pre_eval=True)
+work_dir = './work_CCF/消融实验/sw/1_去掉DenseNet'
+gpu_ids = [0]
 auto_resume = False
