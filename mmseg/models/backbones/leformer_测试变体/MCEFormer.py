@@ -17,9 +17,9 @@ from mmcv.cnn.utils.weight_init import (constant_init, normal_init,
                                         trunc_normal_init)
 from mmcv.runner import BaseModule, ModuleList, Sequential
 
-from ..builder import BACKBONES
-from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
-from ..utils import make_laplace
+from ...builder import BACKBONES
+from ...utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
+from ...utils import make_laplace
 
 
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
@@ -748,201 +748,202 @@ class CrossEncoderFusion(nn.Module):
                 outs.append(x)
 
         return outs
+    
+if 'LEFormer' not in BACKBONES.module_dict:
+    @BACKBONES.register_module()
+    class LEFormer(BaseModule):
+        """The backbone of LEFormer.
 
-@BACKBONES.register_module()
-class LEFormer(BaseModule):
-    """The backbone of LEFormer.
+        This backbone is the implementation of `LEFormer: Simple and
+        Efficient Design for Semantic Segmentation with
+        Transformers <https://arxiv.org/abs/2105.15203>`_.
+        Args:
+            in_channels (int): Number of input channels. Default: 3.
+            embed_dims (int): Embedding dimension. Default: 32.
+            num_stags (int): The num of stages. Default: 4.
+            num_layers (Sequence[int]): The layer number of each transformer encode
+                layer. Default: [2, 2, 2, 3].
+            num_heads (Sequence[int]): The attention heads of each transformer
+                encode layer. Default: [1, 2, 5, 6].
+            patch_sizes (Sequence[int]): The patch_size of each overlapped patch
+                embedding. Default: [7, 3, 3, 3].
+            strides (Sequence[int]): The stride of each overlapped patch embedding.
+                Default: [4, 2, 2, 2].
+            sr_ratios (Sequence[int]): The spatial reduction rate of each
+                transformer encode layer. Default: [8, 4, 2, 1].
+            out_indices (Sequence[int] | int): Output from which stages.
+                Default: (0, 1, 2, 3).
+            mlp_ratio (int): ratio of mlp hidden dim to embedding dim.
+                Default: 4.
+            qkv_bias (bool): Enable bias for qkv if True. Default: True.
+            drop_rate (float): Probability of an element to be zeroed.
+                Default 0.0
+            attn_drop_rate (float): The drop out rate for attention layer.
+                Default 0.0
+            drop_path_rate (float): stochastic depth rate. Default 0.1.
+            norm_cfg (dict): Config dict for normalization layer.
+                Default: dict(type='LN')
+            pool_numbers (int): the number of Pooling Transformer Layers. Default 1.
+            act_cfg (dict): The activation config for FFNs.
+                Default: dict(type='GELU').
+            pretrained (str, optional): model pretrained path. Default: None.
+            init_cfg (dict or list[dict], optional): Initialization config dict.
+                Default: None.
+            with_cp (bool): Use checkpoint or not. Using checkpoint will save
+                some memory while slowing down the training speed. Default: False.
+        """
 
-    This backbone is the implementation of `LEFormer: Simple and
-    Efficient Design for Semantic Segmentation with
-    Transformers <https://arxiv.org/abs/2105.15203>`_.
-    Args:
-        in_channels (int): Number of input channels. Default: 3.
-        embed_dims (int): Embedding dimension. Default: 32.
-        num_stags (int): The num of stages. Default: 4.
-        num_layers (Sequence[int]): The layer number of each transformer encode
-            layer. Default: [2, 2, 2, 3].
-        num_heads (Sequence[int]): The attention heads of each transformer
-            encode layer. Default: [1, 2, 5, 6].
-        patch_sizes (Sequence[int]): The patch_size of each overlapped patch
-            embedding. Default: [7, 3, 3, 3].
-        strides (Sequence[int]): The stride of each overlapped patch embedding.
-            Default: [4, 2, 2, 2].
-        sr_ratios (Sequence[int]): The spatial reduction rate of each
-            transformer encode layer. Default: [8, 4, 2, 1].
-        out_indices (Sequence[int] | int): Output from which stages.
-            Default: (0, 1, 2, 3).
-        mlp_ratio (int): ratio of mlp hidden dim to embedding dim.
-            Default: 4.
-        qkv_bias (bool): Enable bias for qkv if True. Default: True.
-        drop_rate (float): Probability of an element to be zeroed.
-            Default 0.0
-        attn_drop_rate (float): The drop out rate for attention layer.
-            Default 0.0
-        drop_path_rate (float): stochastic depth rate. Default 0.1.
-        norm_cfg (dict): Config dict for normalization layer.
-            Default: dict(type='LN')
-        pool_numbers (int): the number of Pooling Transformer Layers. Default 1.
-        act_cfg (dict): The activation config for FFNs.
-            Default: dict(type='GELU').
-        pretrained (str, optional): model pretrained path. Default: None.
-        init_cfg (dict or list[dict], optional): Initialization config dict.
-            Default: None.
-        with_cp (bool): Use checkpoint or not. Using checkpoint will save
-            some memory while slowing down the training speed. Default: False.
-    """
+        def __init__(self,
+                    in_channels=3, # DDD输入图像的通道数，RGB 图像一般是 3。
+                    embed_dims=32, # 基础嵌入维度，用于 Transformer 的输入通道数。
+                    num_stages=4, # 总共有 4 个阶段，每个阶段可以有不同的 层。
+                    num_layers=(2, 2, 3, 6), # 每个阶段的 Transformer 层数。
+                    num_heads=(1, 2, 5, 6), # 每个阶段的 Transformer 多头注意力的头数。
+                    patch_sizes=(7, 3, 3, 3), # 每个阶段的 Patch Embedding 卷积核大小。
+                    strides=(4, 2, 2, 2), # 每个阶段的 Patch Embedding 步长。
+                    sr_ratios=(8, 4, 2, 1), # 每个阶段的 Transformer 编码层的空间缩减率。
+                    out_indices=(0, 1, 2, 3), # 注意力缩小比例，用于减少计算量。
+                    mlp_ratio=4,  # MLP 隐藏维度与嵌入维度的比例。
+                    drop_rate=0.0,
+                    ffn_classes=1, # 控制使用 MixFFN 的层数
+                    act_cfg=dict(type='GELU'),
+                    norm_cfg=dict(type='LN', eps=1e-6),
+                    pretrained=None,
+                    init_cfg=None,
+                    with_cp=False):
+            super(LEFormer, self).__init__(init_cfg=init_cfg)
 
-    def __init__(self,
-                 in_channels=3, # DDD输入图像的通道数，RGB 图像一般是 3。
-                 embed_dims=32, # 基础嵌入维度，用于 Transformer 的输入通道数。
-                 num_stages=4, # 总共有 4 个阶段，每个阶段可以有不同的 层。
-                 num_layers=(2, 2, 3, 6), # 每个阶段的 Transformer 层数。
-                 num_heads=(1, 2, 5, 6), # 每个阶段的 Transformer 多头注意力的头数。
-                 patch_sizes=(7, 3, 3, 3), # 每个阶段的 Patch Embedding 卷积核大小。
-                 strides=(4, 2, 2, 2), # 每个阶段的 Patch Embedding 步长。
-                 sr_ratios=(8, 4, 2, 1), # 每个阶段的 Transformer 编码层的空间缩减率。
-                 out_indices=(0, 1, 2, 3), # 注意力缩小比例，用于减少计算量。
-                 mlp_ratio=4,  # MLP 隐藏维度与嵌入维度的比例。
-                 drop_rate=0.0,
-                 ffn_classes=1, # 控制使用 MixFFN 的层数
-                 act_cfg=dict(type='GELU'),
-                 norm_cfg=dict(type='LN', eps=1e-6),
-                 pretrained=None,
-                 init_cfg=None,
-                 with_cp=False):
-        super(LEFormer, self).__init__(init_cfg=init_cfg)
+            # cross 变体
+            self.fusion_out_channels_5 = [
+                (64, 16, 5, 32),  
+                (128, 32, 5, 64),  
+                (320, 64, 5, 160),
+                (384,128, 5, 192)
+            ]
+            self.fusion_out_channels_4 = [
+                (64, 16, 4, 32),  
+                (128, 32, 4, 64),  
+                (320, 64, 4, 160),
+                (384,128, 4, 192)
+            ]
+            self.fusion_out_channels_3 = [
+                (64, 16, 3, 32),  
+                (128, 32, 3, 64),  
+                (320, 64, 3, 160),
+                (384,128, 3, 192)
+            ]
+            self.fusion_out_channels_2 = [
+                (64, 16, 2, 32),  
+                (128, 32, 2, 64),  
+                (320, 64, 2, 160),
+                (384,128, 2, 192)
+            ]
 
-        # cross 变体
-        self.fusion_out_channels_5 = [
-            (64, 16, 5, 32),  
-            (128, 32, 5, 64),  
-            (320, 64, 5, 160),
-            (384,128, 5, 192)
-        ]
-        self.fusion_out_channels_4 = [
-            (64, 16, 4, 32),  
-            (128, 32, 4, 64),  
-            (320, 64, 4, 160),
-            (384,128, 4, 192)
-        ]
-        self.fusion_out_channels_3 = [
-            (64, 16, 3, 32),  
-            (128, 32, 3, 64),  
-            (320, 64, 3, 160),
-            (384,128, 3, 192)
-        ]
-        self.fusion_out_channels_2 = [
-            (64, 16, 2, 32),  
-            (128, 32, 2, 64),  
-            (320, 64, 2, 160),
-            (384,128, 2, 192)
-        ]
+            self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_5)
 
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_4)
+            assert not (init_cfg and pretrained), \
+                'init_cfg and pretrained cannot be set at the same time'
+            if isinstance(pretrained, str):
+                warnings.warn('DeprecationWarning: pretrained is deprecated, '
+                            'please use "init_cfg" instead')
+                self.init_cfg = dict(type='Pretrained', checkpoint=pretrained)
+            elif pretrained is not None:
+                raise TypeError('pretrained must be a str or None')
 
-        assert not (init_cfg and pretrained), \
-            'init_cfg and pretrained cannot be set at the same time'
-        if isinstance(pretrained, str):
-            warnings.warn('DeprecationWarning: pretrained is deprecated, '
-                          'please use "init_cfg" instead')
-            self.init_cfg = dict(type='Pretrained', checkpoint=pretrained)
-        elif pretrained is not None:
-            raise TypeError('pretrained must be a str or None')
+            self.in_channels = in_channels
+            self.embed_dims = embed_dims
+            self.num_stages = num_stages
+            self.num_layers = num_layers
+            self.num_heads = num_heads
+            self.patch_sizes = patch_sizes
+            self.strides = strides
+            self.sr_ratios = sr_ratios
+            self.with_cp = with_cp
+            assert num_stages == len(num_layers) == len(num_heads) \
+                == len(patch_sizes) == len(strides) == len(sr_ratios)
 
-        self.in_channels = in_channels
-        self.embed_dims = embed_dims
-        self.num_stages = num_stages
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.patch_sizes = patch_sizes
-        self.strides = strides
-        self.sr_ratios = sr_ratios
-        self.with_cp = with_cp
-        assert num_stages == len(num_layers) == len(num_heads) \
-               == len(patch_sizes) == len(strides) == len(sr_ratios)
+            self.out_indices = out_indices
+            assert max(out_indices) < self.num_stages
 
-        self.out_indices = out_indices
-        assert max(out_indices) < self.num_stages
-
-        cur = 0
-        embed_dims_list = []
-        feedforward_channels_list = []
-        self.transformer_encoder_layers = ModuleList()
-        for i, num_layer in enumerate(num_layers):  # num_layer 是每个阶段的 MLLA 层数
-            embed_dims_i = embed_dims * num_heads[i]
-            embed_dims_list.append(embed_dims_i)
-            patch_embed = PatchEmbed(
-                in_channels=in_channels,
-                embed_dims=embed_dims_i,
-                kernel_size=patch_sizes[i],
-                stride=strides[i],
-                padding=patch_sizes[i] // 2,
-                norm_cfg=norm_cfg)
-            feedforward_channels_list.append(mlp_ratio * embed_dims_i)
-
-            
-            if embed_dims_i==32:
-                self.input_resolution=(64,64)
-            elif embed_dims_i==64:
-                self.input_resolution=(32,32)
-            elif embed_dims_i==160:
-                self.input_resolution=(16,16)
-            elif embed_dims_i==192:
-                self.input_resolution=(8,8)
-                
-            layer = ModuleList([
-                MLLA(
-                    dim=embed_dims_i, 
-                    input_resolution=self.input_resolution,
-                    num_heads=4,
-                    classes= i < ffn_classes
-                ) 
-                    for idx in range(num_layer)
-            ])
-           
-            in_channels = embed_dims_i
-            # The ret[0] of build_norm_layer is norm name.
-            norm = build_norm_layer(norm_cfg, embed_dims_i)[1]
-            
-            self.transformer_encoder_layers.append(ModuleList([patch_embed, layer, norm]))
-            cur += num_layer
-
-        self.cnn_encoder_layers = nn.ModuleList()
-
-        for i in range(num_stages):
-            self.cnn_encoder_layers.append(
-                CnnEncoderLayer(
-                    embed_dims=self.in_channels if i == 0 else embed_dims_list[i - 1],
-                    feedforward_channels=feedforward_channels_list[i],
-                    output_channels=embed_dims_list[i],
+            cur = 0
+            embed_dims_list = []
+            feedforward_channels_list = []
+            self.transformer_encoder_layers = ModuleList()
+            for i, num_layer in enumerate(num_layers):  # num_layer 是每个阶段的 MLLA 层数
+                embed_dims_i = embed_dims * num_heads[i]
+                embed_dims_list.append(embed_dims_i)
+                patch_embed = PatchEmbed(
+                    in_channels=in_channels,
+                    embed_dims=embed_dims_i,
                     kernel_size=patch_sizes[i],
                     stride=strides[i],
                     padding=patch_sizes[i] // 2,
-                    ffn_drop=drop_rate
+                    norm_cfg=norm_cfg)
+                feedforward_channels_list.append(mlp_ratio * embed_dims_i)
+
+                
+                if embed_dims_i==32:
+                    self.input_resolution=(64,64)
+                elif embed_dims_i==64:
+                    self.input_resolution=(32,32)
+                elif embed_dims_i==160:
+                    self.input_resolution=(16,16)
+                elif embed_dims_i==192:
+                    self.input_resolution=(8,8)
+                    
+                layer = ModuleList([
+                    MLLA(
+                        dim=embed_dims_i, 
+                        input_resolution=self.input_resolution,
+                        num_heads=4,
+                        classes= i < ffn_classes
+                    ) 
+                        for idx in range(num_layer)
+                ])
+            
+                in_channels = embed_dims_i
+                # The ret[0] of build_norm_layer is norm name.
+                norm = build_norm_layer(norm_cfg, embed_dims_i)[1]
+                
+                self.transformer_encoder_layers.append(ModuleList([patch_embed, layer, norm]))
+                cur += num_layer
+
+            self.cnn_encoder_layers = nn.ModuleList()
+
+            for i in range(num_stages):
+                self.cnn_encoder_layers.append(
+                    CnnEncoderLayer(
+                        embed_dims=self.in_channels if i == 0 else embed_dims_list[i - 1],
+                        feedforward_channels=feedforward_channels_list[i],
+                        output_channels=embed_dims_list[i],
+                        kernel_size=patch_sizes[i],
+                        stride=strides[i],
+                        padding=patch_sizes[i] // 2,
+                        ffn_drop=drop_rate
+                    )
                 )
-            )
 
-    def init_weights(self):
-        if self.init_cfg is None:
-            for m in self.modules():
-                if isinstance(m, nn.Linear):
-                    trunc_normal_init(m, std=.02, bias=0.)
-                elif isinstance(m, nn.LayerNorm):
-                    constant_init(m, val=1.0, bias=0.)
-                elif isinstance(m, nn.Conv2d):
-                    fan_out = m.kernel_size[0] * m.kernel_size[
-                        1] * m.out_channels
-                    fan_out //= m.groups
-                    normal_init(
-                        m, mean=0, std=math.sqrt(2.0 / fan_out), bias=0)
-        else:
-            super(LEFormer, self).init_weights()
+        def init_weights(self):
+            if self.init_cfg is None:
+                for m in self.modules():
+                    if isinstance(m, nn.Linear):
+                        trunc_normal_init(m, std=.02, bias=0.)
+                    elif isinstance(m, nn.LayerNorm):
+                        constant_init(m, val=1.0, bias=0.)
+                    elif isinstance(m, nn.Conv2d):
+                        fan_out = m.kernel_size[0] * m.kernel_size[
+                            1] * m.out_channels
+                        fan_out //= m.groups
+                        normal_init(
+                            m, mean=0, std=math.sqrt(2.0 / fan_out), bias=0)
+            else:
+                super(LEFormer, self).init_weights()
 
-    def forward(self, x):
-             return self.cross_encoder_fusion(
-                x,
-                cnn_encoder_layers=self.cnn_encoder_layers,
-                transformer_encoder_layers=self.transformer_encoder_layers,
-                out_indices=self.out_indices
-            )
-             
+        def forward(self, x):
+                return self.cross_encoder_fusion(
+                    x,
+                    cnn_encoder_layers=self.cnn_encoder_layers,
+                    transformer_encoder_layers=self.transformer_encoder_layers,
+                    out_indices=self.out_indices
+                )
+                

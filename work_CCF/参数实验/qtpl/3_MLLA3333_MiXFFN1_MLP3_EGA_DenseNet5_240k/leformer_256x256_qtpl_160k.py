@@ -7,7 +7,7 @@ model = dict(
         in_channels=3,
         embed_dims=32,
         num_stages=4,
-        num_layers=[2, 2, 3, 6],
+        num_layers=[3, 3, 3, 3],
         num_heads=[1, 2, 5, 6],
         patch_sizes=[7, 3, 3, 3],
         strides=[4, 2, 2, 2],
@@ -177,6 +177,6 @@ lr_config = dict(
 runner = dict(type='IterBasedRunner', max_iters=240000)
 checkpoint_config = dict(by_epoch=False, interval=20000)
 evaluation = dict(interval=20000, metric=['mIoU', 'mFscore'], pre_eval=True)
-work_dir = './work_CCF/消融实验/qtpl/1_去掉DenseNet'
-gpu_ids = [7]
+work_dir = './work_CCF/参数实验/qtpl/3_MLLA3333_MiXFFN1_MLP3_EGA_DenseNet5_240k'
+gpu_ids = [3]
 auto_resume = False

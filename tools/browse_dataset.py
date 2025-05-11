@@ -29,7 +29,7 @@ def parse_args():
         'all pipeline except `Load` will be skipped')
     parser.add_argument(
         '--output-dir',
-        default='./output',
+        default='./output1',
         type=str,
         help='If there is no display interface, you can save it')
     parser.add_argument('--show', default=False, action='store_true')
@@ -100,7 +100,11 @@ def imshow_semantic(img,
     assert 0 < opacity <= 1.0
     color_seg = np.zeros((seg.shape[0], seg.shape[1], 3), dtype=np.uint8)
     for label, color in enumerate(palette):
-        color_seg[seg == label, :] = color
+        if label == 0:
+            color_seg[seg == label, :] = [255, 0, 0]  # 红色背景
+        else:
+            color_seg[seg == label, :] = color
+
     # convert to BGR
     color_seg = color_seg[..., ::-1]
 

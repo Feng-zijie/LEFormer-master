@@ -164,6 +164,43 @@ def main():
         distributed = True
         init_dist(args.launcher, **cfg.dist_params)
 
+    # # build the model and load checkpoint
+    # cfg.model.train_cfg = None
+    # model = build_segmentor(cfg.model, test_cfg=cfg.get('test_cfg'))
+    # checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
+    # model.CLASSES = checkpoint['meta'].get('CLASSES', None)
+    # model.PALETTE = checkpoint['meta'].get('PALETTE', None)
+
+    # # Load a single image for visualization
+    # img_path = '/home/wangzhecheng/Fengzijie/00000-03789.png'  # 修改为你的图片路径
+    # img = mmcv.imread(img_path)
+    # img = mmcv.imresize(img, (cfg.data.test.pipeline[1].img_scale))
+
+    # # Prepare the input
+    # device = get_device()
+    # model = model.to(device)
+    # model.eval()
+    # img_tensor = mmcv.imnormalize(
+    #     img, mean=cfg.img_norm_cfg['mean'], std=cfg.img_norm_cfg['std'], to_rgb=cfg.img_norm_cfg['to_rgb'])
+    # img_tensor = torch.from_numpy(img_tensor.transpose(2, 0, 1)).unsqueeze(0).to(device)
+
+    # # Inference
+    # with torch.no_grad():
+    #     result = model.forward_dummy(img_tensor)
+
+    # # Generate heatmap
+    # heatmap = result[0].cpu().numpy()
+    # heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min())  # Normalize to [0, 1]
+    # heatmap = (heatmap * 255).astype('uint8')
+    # heatmap = mmcv.imresize(heatmap, img.shape[:2][::-1])
+
+    # # Overlay heatmap on the original image
+    # overlay = mmcv.imshow_det_bboxes(
+    #     img, None, None, show=False, wait_time=0, out_file=None, opacity=0.5)
+    # mmcv.imwrite(overlay, '/home/wangzhecheng/Fengzijie/heatmap_overlay.jpg')  # 修改为保存路径
+
+    # print('Heatmap and overlay saved successfully.')
+
     rank, _ = get_dist_info()
     # allows not to create
     if args.work_dir is not None and rank == 0:

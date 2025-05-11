@@ -177,6 +177,6 @@ lr_config = dict(
 runner = dict(type='IterBasedRunner', max_iters=240000)
 checkpoint_config = dict(by_epoch=False, interval=20000)
 evaluation = dict(interval=20000, metric=['mIoU', 'mFscore'], pre_eval=True)
-work_dir = './work_CCF/消融实验/qtpl/1_去掉DenseNet'
-gpu_ids = [7]
+work_dir = './work_CCF/参数实验/qtpl/6_MLLA2236_MiXFFN1_MLP3_EGA_DenseNet4_240k'
+gpu_ids = [1]
 auto_resume = False

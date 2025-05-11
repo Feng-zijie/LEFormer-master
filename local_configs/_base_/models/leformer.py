@@ -11,8 +11,8 @@ model = dict(
 
         # √的层数
         # num_layers=[2, 2, 3, 6],
-        
-        num_layers=[1, 1, 1, 1],
+         
+        num_layers=[2, 2, 3, 6],
         num_heads=[1, 2, 5, 6],
 
         patch_sizes=[7, 3, 3, 3],
