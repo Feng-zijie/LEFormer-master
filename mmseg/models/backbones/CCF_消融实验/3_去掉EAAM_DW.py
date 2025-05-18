@@ -19,10 +19,13 @@ from mmcv.runner import BaseModule, ModuleList, Sequential
 
 from ..builder import BACKBONES
 from ..utils import PatchEmbed, nchw_to_nlc, nlc_to_nchw
+from ..utils import make_laplace
+
 
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
+
 
 class DepthWiseConvModule(BaseModule):
     """An implementation of one Depth-wise Conv Module of LEFormer.
@@ -340,6 +343,13 @@ class MLLA(nn.Module):
         self.norm2 = norm_layer(dim)
         
         if self.classes:
+            self.mlp = Mlp(
+                in_features=dim, 
+                hidden_features=int(dim * mlp_ratio), 
+                act_layer=act_layer, 
+                drop=drop
+            )
+        else :
             self.mix_ffn = MixFFN(
                 embed_dims=dim,
                 feedforward_channels=4 * dim,
@@ -347,13 +357,7 @@ class MLLA(nn.Module):
                 dropout_layer=dict(type='DropPath', drop_prob=drop_path),
                 act_cfg=dict(type='GELU')
             )
-        else :
-            self.mlp = Mlp(
-                in_features=dim, 
-                hidden_features=int(dim * mlp_ratio), 
-                act_layer=act_layer, 
-                drop=drop
-            )
+
         
         
     def forward(self, x):
@@ -368,97 +372,11 @@ class MLLA(nn.Module):
         
         # FFN
         if self.classes:
-            x = x + self.drop_path(self.mix_ffn(self.norm2(x),(H,W))) 
-        else: 
             x = x + self.drop_path(self.mlp(self.norm2(x)))
+        else: 
+            x = x + self.drop_path(self.mix_ffn(self.norm2(x),(H,W))) 
             
         return x
-
-class ChannelAttentionModule(BaseModule):
-    """An implementation of one Channel Attention Module of LEFormer.
-
-        Args:
-            embed_dims (int): The embedding dimension.
-    """
-
-    def __init__(self, embed_dims):
-        super(ChannelAttentionModule, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        self.shared_MLP = nn.Sequential(
-            Conv2d(embed_dims, embed_dims // 4, 1, bias=False),
-            nn.ReLU(),
-            Conv2d(embed_dims // 4, embed_dims, 1, bias=False)
-        )
-
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.shared_MLP(self.avg_pool(x))
-        max_out = self.shared_MLP(self.max_pool(x))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-
-class SpatialAttentionModule(BaseModule):
-    """An implementation of one Spatial Attention Module of LEFormer.
-
-        Args:
-            kernel_size (int): The kernel size of Conv2d. Default: 3.
-    """
-
-    def __init__(self, kernel_size=3):
-        super(SpatialAttentionModule, self).__init__()
-
-        padding = 3 if kernel_size == 7 else 1
-
-        self.conv1 = Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-
-class MultiscaleCBAMLayer(BaseModule):
-    """An implementation of Multiscale CBAM layer of LEFormer.
-
-        Args:
-            embed_dims (int): The feature dimension.
-            kernel_size (int): The kernel size of Conv2d. Default: 7.
-        """
-
-    def __init__(self, embed_dims, kernel_size=7):
-        super(MultiscaleCBAMLayer, self).__init__()
-        self.channel_attention = ChannelAttentionModule(embed_dims // 4)
-        self.spatial_attention = SpatialAttentionModule(kernel_size)
-        self.multiscale_conv = nn.ModuleList()
-        for i in range(1, 5):
-            self.multiscale_conv.append(
-                Conv2d(
-                    in_channels=embed_dims // 4,
-                    out_channels=embed_dims // 4,
-                    kernel_size=3,
-                    stride=1,
-                    padding=(2 * i + 1) // 2,
-                    bias=True,
-                    dilation=(2 * i + 1) // 2)
-            )
-
-    def forward(self, x):
-        outs = torch.split(x, x.shape[1] // 4, dim=1)
-        out_list = []
-        for (i, out) in enumerate(outs):
-            out = self.multiscale_conv[i](out)
-            out = self.channel_attention(out) * out
-            out_list.append(out)
-        out = torch.cat(out_list, dim=1)
-        out = self.spatial_attention(out) * out
-        return out
 
 class CnnEncoderLayer(BaseModule):
     """Implements one cnn encoder layer in LEFormer.
@@ -495,19 +413,11 @@ class CnnEncoderLayer(BaseModule):
         self.output_channels = output_channels
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
-
-        self.layers = DepthWiseConvModule(embed_dims=embed_dims,
-                                          feedforward_channels=feedforward_channels // 2,
-                                          output_channels=output_channels,
-                                          kernel_size=kernel_size,
-                                          stride=stride,
-                                          padding=padding,
-                                          act_cfg=dict(type='GELU'),
-                                          ffn_drop=ffn_drop)
-
+        
+        self.simple_conv = nn.Conv2d(embed_dims, output_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
+        
         self.norm = nn.BatchNorm2d(output_channels)
-        self.multiscale_cbam = MultiscaleCBAMLayer(output_channels, kernel_size)
-
+    
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
             nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),  # 普通残差  
@@ -527,12 +437,8 @@ class CnnEncoderLayer(BaseModule):
         # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
 
-        out = self.layers(x)
+        out = self.simple_conv(x)
         
-        
-        # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
-        out = self.multiscale_cbam(out)
-
         _, _, H, W=out.shape
 
         if H == 64:
@@ -548,7 +454,7 @@ class CnnEncoderLayer(BaseModule):
             print(f"mismatch: identity={identity.shape}, out={out.shape}")
             identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
 
-        out += identity
+        out = out + identity
         out = F.relu(out)
         return out
 
@@ -608,7 +514,7 @@ class CrossEncoderFusion(nn.Module):
 
         for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(zip(cnn_encoder_layers, transformer_encoder_layers)):
             # CNN 分支
-            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
+            cnn_encoder_out = cnn_encoder_layer(x)
 
             # 经过 Transformer 编码器的每一层 : transformer_encoder_layer[0] -> transformer_encoder_layer[1]
             # 1. torch.Size([16, 4096, 32]) (64, 64)   ->   torch.Size([16, 4096, 32]) (64, 64)
@@ -691,7 +597,7 @@ class LEFormer(BaseModule):
                  out_indices=(0, 1, 2, 3), # 注意力缩小比例，用于减少计算量。
                  mlp_ratio=4,  # MLP 隐藏维度与嵌入维度的比例。
                  drop_rate=0.0,
-                 ffn_classes=3, # 控制使用 MixFFN 的层数
+                 ffn_classes=1, # 控制使用 MixFFN 的层数
                  act_cfg=dict(type='GELU'),
                  norm_cfg=dict(type='LN', eps=1e-6),
                  pretrained=None,
@@ -725,7 +631,7 @@ class LEFormer(BaseModule):
             (384,128, 2, 192)
         ]
 
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_3)
+        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_5)
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -832,3 +738,4 @@ class LEFormer(BaseModule):
                 transformer_encoder_layers=self.transformer_encoder_layers,
                 out_indices=self.out_indices
             )
+             

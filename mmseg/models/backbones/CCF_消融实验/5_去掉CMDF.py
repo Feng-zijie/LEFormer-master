@@ -606,8 +606,15 @@ class CnnEncoderLayer(BaseModule):
         self.output_channels = output_channels
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
-        
-        self.simple_conv = nn.Conv2d(embed_dims, output_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
+
+        self.layers = DepthWiseConvModule(embed_dims=embed_dims,
+                                          feedforward_channels=feedforward_channels // 2,
+                                          output_channels=output_channels,
+                                          kernel_size=kernel_size,
+                                          stride=stride,
+                                          padding=padding,
+                                          act_cfg=dict(type='GELU'),
+                                          ffn_drop=ffn_drop)
 
         self.norm = nn.BatchNorm2d(output_channels)
         
@@ -632,7 +639,7 @@ class CnnEncoderLayer(BaseModule):
         # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
 
-        out = self.simple_conv(x)
+        out = self.layers(x)
         
         
         # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
@@ -658,88 +665,38 @@ class CnnEncoderLayer(BaseModule):
         out = F.relu(out)
         return out
 
-# cross 变体
-class DenseLayer(nn.Module):
-    """Dense Block 内部的一层"""
-    def __init__(self, in_channels, growth_rate):
-        super(DenseLayer, self).__init__()
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.conv1 = nn.Conv2d(in_channels, 4 * growth_rate, kernel_size=1, bias=True)
-        
-        self.bn2 = nn.BatchNorm2d(4 * growth_rate)
-        self.conv2 = nn.Conv2d(4 * growth_rate, growth_rate, kernel_size=3, padding=1, bias=True)
-
-    def forward(self, x):
-        out = self.conv1(F.relu(self.bn1(x)))
-        out = self.conv2(F.relu(self.bn2(out)))
-        return torch.cat([x, out], dim=1)  # 维度拼接，增加通道数
-
-class DenseBlock(nn.Module):
-    """包含多个 DenseLayer,并使用 1x1 卷积降维"""
-    def __init__(self, num_layers, in_channels, growth_rate, out_channels):
-        super(DenseBlock, self).__init__()
-        self.layers = nn.ModuleList()
-        current_channels = in_channels  # 记录当前通道数
-        
-        for _ in range(num_layers):
-            self.layers.append(DenseLayer(current_channels, growth_rate))
-            current_channels += growth_rate  # 每层增加 growth_rate 个通道
-        
-        # 使用 1x1 卷积降维到目标通道数
-        self.conv1x1 = nn.Conv2d(current_channels, out_channels, kernel_size=1, bias=True)
-        self.bn = nn.BatchNorm2d(out_channels)
-
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)  # 逐层拼接
-        x = self.conv1x1(x)  # 1x1 降维
-        x = F.relu(self.bn(x))  # BN + ReLU
-        return x
-
 class CrossEncoderFusion(nn.Module):
-    def __init__(self, fusion_out_channels):
+    def __init__(self):
         super(CrossEncoderFusion, self).__init__()
-        
-        self.fusion_blocks = nn.ModuleList([
-            DenseBlock(num_layers, in_channels, growth_rate, out_channels) 
-            for in_channels, growth_rate, num_layers, out_channels in fusion_out_channels
-        ])
 
-    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, out_indices):
+    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, fusion_conv_layers, out_indices):
         outs = []
         cnn_encoder_out = x
 
-        # 刚来的 x.shape 为 [16, 3, 256, 256]
-
-
-        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(zip(cnn_encoder_layers, transformer_encoder_layers)):
-            # CNN 分支
-            cnn_encoder_out = cnn_encoder_layer(x)
-
-            # 经过 Transformer 编码器的每一层 : transformer_encoder_layer[0] -> transformer_encoder_layer[1]
-            # 1. torch.Size([16, 4096, 32]) (64, 64)   ->   torch.Size([16, 4096, 32]) (64, 64)
-            # 2. torch.Size([16, 1024, 64]) (32, 32)   ->   torch.Size([16, 1024, 64]) (32, 32)
-            # 3. torch.Size([16, 256, 160]) (16, 16)   ->   torch.Size([16, 256, 160]) (16, 16)
-            # 4. torch.Size([16, 64, 192]) (8, 8)   ->   torch.Size([16, 64, 192]) (8, 8)
-            # Transformer 分支
+        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(
+                zip(cnn_encoder_layers, transformer_encoder_layers)):
+            
+            cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out) # [16, 3, 256, 256] → [16, 32, 128, 128] → [16, 64, 64, 64] → [16, 128, 32, 32] → [16, 256, 16, 16]
+            
             x, hw_shape = transformer_encoder_layer[0](x)
-
-
+            
+            
             for block in transformer_encoder_layer[1]:
                 x = block(x)
-                
+
+            
+            # 过了block后的x的shape
+            # torch.Size([16, 4096, 32])   torch.Size([16, 1024, 64])  torch.Size([16, 256, 160])  torch.Size([16, 64, 192])
+
             x = transformer_encoder_layer[2](x)
             x = nlc_to_nchw(x, hw_shape)
 
-            # 拼接 CNN 和 Transformer 特征
-            fusion_input = torch.cat((cnn_encoder_out, x), dim=1)
-
-            # 经过 DenseBlock 进行融合
-            x = self.fusion_blocks[i](fusion_input)
+            x = torch.cat((x, cnn_encoder_out), dim=1)
+            
+            x = fusion_conv_layers[i](x)
 
             if i in out_indices:
                 outs.append(x)
-
         return outs
 
 @BACKBONES.register_module()
@@ -805,33 +762,7 @@ class LEFormer(BaseModule):
                  with_cp=False):
         super(LEFormer, self).__init__(init_cfg=init_cfg)
 
-        # cross 变体
-        self.fusion_out_channels_5 = [
-            (64, 16, 5, 32),  
-            (128, 32, 5, 64),  
-            (320, 64, 5, 160),
-            (384,128, 5, 192)
-        ]
-        self.fusion_out_channels_4 = [
-            (64, 16, 4, 32),  
-            (128, 32, 4, 64),  
-            (320, 64, 4, 160),
-            (384,128, 4, 192)
-        ]
-        self.fusion_out_channels_3 = [
-            (64, 16, 3, 32),  
-            (128, 32, 3, 64),  
-            (320, 64, 3, 160),
-            (384,128, 3, 192)
-        ]
-        self.fusion_out_channels_2 = [
-            (64, 16, 2, 32),  
-            (128, 32, 2, 64),  
-            (320, 64, 2, 160),
-            (384,128, 2, 192)
-        ]
-
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_5)
+        self.cross_encoder_fusion=CrossEncoderFusion()
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -901,6 +832,7 @@ class LEFormer(BaseModule):
             cur += num_layer
 
         self.cnn_encoder_layers = nn.ModuleList()
+        self.fusion_conv_layers = nn.ModuleList()
 
         for i in range(num_stages):
             self.cnn_encoder_layers.append(
@@ -913,6 +845,15 @@ class LEFormer(BaseModule):
                     padding=patch_sizes[i] // 2,
                     ffn_drop=drop_rate
                 )
+            )
+            self.fusion_conv_layers.append(
+                Conv2d(
+                    in_channels=embed_dims_list[i] * 2,
+                    out_channels=embed_dims_list[i],
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=True)
             )
 
     def init_weights(self):
@@ -936,6 +877,7 @@ class LEFormer(BaseModule):
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,
                 transformer_encoder_layers=self.transformer_encoder_layers,
+                fusion_conv_layers=self.fusion_conv_layers,
                 out_indices=self.out_indices
             )
              

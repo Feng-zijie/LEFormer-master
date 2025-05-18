@@ -254,130 +254,6 @@ class LinearAttention(nn.Module):
     def extra_repr(self) -> str:
         return f'dim={self.dim}, num_heads={self.num_heads}'
     
-class MLLABlock(nn.Module):
-    r""" MLLA Block.
-
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resolution.
-        num_heads (int): Number of attention heads.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
-    """
-
-    def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, **kwargs):
-        super().__init__()
-        
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.mlp_ratio = mlp_ratio
-
-        self.norm1 = norm_layer(dim)
-        self.in_proj = nn.Linear(dim, dim)
-        self.act_proj = nn.Linear(dim, dim)
-        self.dwc = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.act = nn.SiLU()
-        self.attn = LinearAttention(dim=dim, input_resolution=input_resolution, num_heads=num_heads, qkv_bias=qkv_bias)
-        self.out_proj = nn.Linear(dim, dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.cpe2 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-
-    def forward(self, x, shortcut):
-        H, W = self.input_resolution
-        B, L, C = x.shape
-
-        act_res = self.act(self.act_proj(x))
-        x = self.in_proj(x).view(B, H, W, C)
-        x = self.act(self.dwc(x.permute(0, 3, 1, 2))).permute(0, 2, 3, 1).view(B, L, C)
-
-        # Linear Attention
-        x = self.attn(x)
-
-        x = self.out_proj(x * act_res)
-        x = shortcut + self.drop_path(x)
-        x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
-
-        return x
-    
-    
-class MLLA(nn.Module):
-    r""" MLLA Block.
-    Args:
-        dim (int): Number of input channels.
-        input_resolution (tuple[int]): Input resulotion.
-        num_heads (int): Number of attention heads.
-        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
-        drop (float, optional): Dropout rate. Default: 0.0
-        drop_path (float, optional): Stochastic depth rate. Default: 0.0
-        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-    def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm , classes=False,**kwargs):
-        super().__init__()
-        
-        self.mlla_block = MLLABlock(
-            dim=dim,
-            input_resolution=input_resolution,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            qkv_bias=qkv_bias,
-            drop=drop,
-            drop_path=drop_path,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
-            **kwargs
-        )
-        
-        self.classes = classes
-        self.cpe = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-        self.norm1 = norm_layer(dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        
-        if self.classes:
-            self.mix_ffn = MixFFN(
-                embed_dims=dim,
-                feedforward_channels=4 * dim,
-                ffn_drop=drop_path,
-                dropout_layer=dict(type='DropPath', drop_prob=drop_path),
-                act_cfg=dict(type='GELU')
-            )
-        else :
-            self.mlp = Mlp(
-                in_features=dim, 
-                hidden_features=int(dim * mlp_ratio), 
-                act_layer=act_layer, 
-                drop=drop
-            )
-        
-        
-    def forward(self, x):
-        H, W = self.mlla_block.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        x = x + self.cpe(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
-        shortcut = x
-        x = self.norm1(x)
-        
-        x=self.mlla_block(x,shortcut)
-        
-        # FFN
-        if self.classes:
-            x = x + self.drop_path(self.mix_ffn(self.norm2(x),(H,W))) 
-        else: 
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-            
-        return x
-
-
 class ChannelGate(nn.Module):
     def __init__(self, gate_channels, reduction_ratio=16):
         super(ChannelGate, self).__init__()
@@ -423,12 +299,109 @@ class CBAM(nn.Module):
         x_out = self.SpatialGate(x_out)
         return x_out
 
+# MDFA的空间和通道注意力模块
+class tongdao(nn.Module):  #处理通道部分   函数名就是拼音名称
+    # 通道模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 自适应平均池化，输出大小为1x1
+        self.fc = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于降维
+        self.relu = nn.ReLU(inplace=False)  # ReLU激活函数，就地操作以节省内存
+
+    # 前向传播函数
+    def forward(self, x):
+        b, c, _, _ = x.size()  # 提取批次大小和通道数
+        y = self.avg_pool(x)  # 应用自适应平均池化
+        y = self.fc(y)  # 应用1x1卷积
+        y = self.relu(y)  # 应用ReLU激活
+        y = nn.functional.interpolate(y, size=(x.size(2), x.size(3)), mode='nearest')  # 调整y的大小以匹配x的空间维度
+        return x * y.expand_as(x)  # 将计算得到的通道权重应用到输入x上，实现特征重校准
+
+class kongjian(nn.Module):
+    # 空间模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.Conv1x1 = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于产生空间激励
+        self.norm = nn.Sigmoid()  # Sigmoid函数用于归一化
+
+    # 前向传播函数
+    def forward(self, x):
+        y = self.Conv1x1(x)  # 应用1x1卷积
+        y = self.norm(y)  # 应用Sigmoid函数
+        return x * y  # 将空间权重应用到输入x上，实现空间激励
+
+class hebing(nn.Module):    #函数名为合并, 意思是把空间和通道分别提取的特征合并起来
+    # 合并模块初始化，输入通道数为in_channel
+    def __init__(self, in_channel):
+        super().__init__()
+        self.tongdao = tongdao(in_channel)  # 创建通道子模块
+        self.kongjian = kongjian(in_channel)  # 创建空间子模块
+
+    # 前向传播函数
+    def forward(self, U):
+        U_kongjian = self.kongjian(U)  # 通过空间模块处理输入U
+        U_tongdao = self.tongdao(U)  # 通过通道模块处理输入U
+        return torch.max(U_tongdao, U_kongjian)  # 取两者的逐元素最大值，结合通道和空间激励
+
+
+# 修改所有 ReLU 的 inplace 参数为 False
+class MDFA(nn.Module):  # 多尺度空洞融合注意力模块
+    def __init__(self, dim_in, dim_out, rate=1, bn_mom=0.1):
+        super(MDFA, self).__init__()
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 1, 1, padding=0, dilation=rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=6 * rate, dilation=6 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=12 * rate, dilation=12 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch4 = nn.Sequential(
+            nn.Conv2d(dim_in, dim_out, 3, 1, padding=18 * rate, dilation=18 * rate, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False), 
+        )
+        self.branch5_conv = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=True)
+        self.branch5_bn = nn.BatchNorm2d(dim_out, momentum=bn_mom)
+        self.branch5_relu = nn.ReLU(inplace=False)  
+
+        self.conv_cat = nn.Sequential(
+            nn.Conv2d(dim_out * 5, dim_out, 1, 1, padding=0, bias=True),
+            nn.BatchNorm2d(dim_out, momentum=bn_mom),
+            nn.ReLU(inplace=False),
+        )
+        self.Hebing = hebing(in_channel=dim_out * 5)
+
+    def forward(self, x):
+        [b, c, row, col] = x.size()
+        conv1x1 = self.branch1(x)
+        conv3x3_1 = self.branch2(x)
+        conv3x3_2 = self.branch3(x)
+        conv3x3_3 = self.branch4(x)
+        global_feature = torch.mean(x, 2, True)
+        global_feature = torch.mean(global_feature, 3, True)
+        global_feature = self.branch5_conv(global_feature)
+        global_feature = self.branch5_bn(global_feature)
+        global_feature = self.branch5_relu(global_feature)
+        global_feature = F.interpolate(global_feature, (row, col), None, 'bilinear', True)
+        feature_cat = torch.cat([conv1x1, conv3x3_1, conv3x3_2, conv3x3_3, global_feature], dim=1)
+        larry = self.Hebing(feature_cat)
+        larry_feature_cat = larry * feature_cat
+        result = self.conv_cat(larry_feature_cat)
+        return result
 
 # Edge-Guided Attention Module
 class EGA(nn.Module):
     def __init__(self, in_channels):
         super(EGA, self).__init__()
-
+    
         self.fusion_conv = nn.Sequential(
             nn.Conv2d(in_channels * 3, in_channels, 3, 1, 1),
             nn.BatchNorm2d(in_channels),
@@ -440,6 +413,7 @@ class EGA(nn.Module):
             nn.Sigmoid())
 
         self.cbam = CBAM(in_channels)
+        self.mdfa_block = MDFA(dim_in=in_channels, dim_out=in_channels)
         self.pred_conv = nn.Conv2d(in_channels, 1, kernel_size=3, stride=1, padding=1)  # 用于生成 pred
 
     def forward(self, edge_feature, x):
@@ -467,7 +441,9 @@ class EGA(nn.Module):
         fusion_feature = fusion_feature * attention_map
 
         out = fusion_feature + residual
-        out = self.cbam(out)
+              
+        out = self.mdfa_block(out)
+     
         return out
 
 class CnnEncoderLayer(BaseModule):
@@ -560,9 +536,29 @@ class CnnEncoderLayer(BaseModule):
             print(f"mismatch: identity={identity.shape}, out={out.shape}")
             identity = F.interpolate(identity, size=out.shape[2:], mode='bilinear', align_corners=False)
 
-        out += identity
+        out = out + identity
         out = F.relu(out)
         return out
+
+
+class SimplifiedEncoder(nn.Module):
+    def __init__(self, 
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                stride=2,
+                padding=0,
+        ):
+        super(SimplifiedEncoder, self).__init__()
+
+        self.fc = Conv2d(in_channels, out_channels,kernel_size=kernel_size, stride=stride, padding=padding)
+
+    def forward(self, x):
+        
+        out= self.fc(x)
+
+        return out
+
 
 # cross 变体
 class DenseLayer(nn.Module):
@@ -603,46 +599,25 @@ class DenseBlock(nn.Module):
         return x
 
 class CrossEncoderFusion(nn.Module):
-    def __init__(self, fusion_out_channels):
+    def __init__(self):
         super(CrossEncoderFusion, self).__init__()
-        
-        self.fusion_blocks = nn.ModuleList([
-            DenseBlock(num_layers, in_channels, growth_rate, out_channels) 
-            for in_channels, growth_rate, num_layers, out_channels in fusion_out_channels
-        ])
 
-    def forward(self, x, cnn_encoder_layers, transformer_encoder_layers, out_indices):
+    def forward(self, x, cnn_encoder_layers, simplified_encoder_layers, fusion_conv_layers, out_indices):
         outs = []
         cnn_encoder_out = x
 
         # 刚来的 x.shape 为 [16, 3, 256, 256]
 
-
-        for i, (cnn_encoder_layer, transformer_encoder_layer) in enumerate(zip(cnn_encoder_layers, transformer_encoder_layers)):
+        for i, (cnn_encoder_layer,simplified_encoder_layer) in enumerate(zip(cnn_encoder_layers,simplified_encoder_layers)):
             # CNN 分支
             cnn_encoder_out = cnn_encoder_layer(cnn_encoder_out)
+            
+            x= simplified_encoder_layer(x)
 
-            # 经过 Transformer 编码器的每一层 : transformer_encoder_layer[0] -> transformer_encoder_layer[1]
-            # 1. torch.Size([16, 4096, 32]) (64, 64)   ->   torch.Size([16, 4096, 32]) (64, 64)
-            # 2. torch.Size([16, 1024, 64]) (32, 32)   ->   torch.Size([16, 1024, 64]) (32, 32)
-            # 3. torch.Size([16, 256, 160]) (16, 16)   ->   torch.Size([16, 256, 160]) (16, 16)
-            # 4. torch.Size([16, 64, 192]) (8, 8)   ->   torch.Size([16, 64, 192]) (8, 8)
-            # Transformer 分支
-            x, hw_shape = transformer_encoder_layer[0](x)
+            x = torch.cat((cnn_encoder_out, x), dim=1)
 
-
-            for block in transformer_encoder_layer[1]:
-                x = block(x)
-                
-            x = transformer_encoder_layer[2](x)
-            x = nlc_to_nchw(x, hw_shape)
-
-            # 拼接 CNN 和 Transformer 特征
-            fusion_input = torch.cat((cnn_encoder_out, x), dim=1)
-
-            # 经过 DenseBlock 进行融合
-            x = self.fusion_blocks[i](fusion_input)
-
+            x = fusion_conv_layers[i](x)
+            
             if i in out_indices:
                 outs.append(x)
 
@@ -703,7 +678,7 @@ class LEFormer(BaseModule):
                  out_indices=(0, 1, 2, 3), # 注意力缩小比例，用于减少计算量。
                  mlp_ratio=4,  # MLP 隐藏维度与嵌入维度的比例。
                  drop_rate=0.0,
-                 ffn_classes=3, # 控制使用 MixFFN 的层数
+                 ffn_classes=1, # 控制使用 MixFFN 的层数
                  act_cfg=dict(type='GELU'),
                  norm_cfg=dict(type='LN', eps=1e-6),
                  pretrained=None,
@@ -711,33 +686,7 @@ class LEFormer(BaseModule):
                  with_cp=False):
         super(LEFormer, self).__init__(init_cfg=init_cfg)
 
-        # cross 变体
-        self.fusion_out_channels_5 = [
-            (64, 16, 5, 32),  
-            (128, 32, 5, 64),  
-            (320, 64, 5, 160),
-            (384,128, 5, 192)
-        ]
-        self.fusion_out_channels_4 = [
-            (64, 16, 4, 32),  
-            (128, 32, 4, 64),  
-            (320, 64, 4, 160),
-            (384,128, 4, 192)
-        ]
-        self.fusion_out_channels_3 = [
-            (64, 16, 3, 32),  
-            (128, 32, 3, 64),  
-            (320, 64, 3, 160),
-            (384,128, 3, 192)
-        ]
-        self.fusion_out_channels_2 = [
-            (64, 16, 2, 32),  
-            (128, 32, 2, 64),  
-            (320, 64, 2, 160),
-            (384,128, 2, 192)
-        ]
-
-        self.cross_encoder_fusion=CrossEncoderFusion(self.fusion_out_channels_3)
+        self.cross_encoder_fusion=CrossEncoderFusion()
 
         assert not (init_cfg and pretrained), \
             'init_cfg and pretrained cannot be set at the same time'
@@ -763,50 +712,19 @@ class LEFormer(BaseModule):
         self.out_indices = out_indices
         assert max(out_indices) < self.num_stages
 
-        cur = 0
         embed_dims_list = []
         feedforward_channels_list = []
-        self.transformer_encoder_layers = ModuleList()
-        for i, num_layer in enumerate(num_layers):  # num_layer 是每个阶段的 MLLA 层数
+        self.simplified_Encoder = SimplifiedEncoder(in_channels, embed_dims)
+        
+    
+        self.cnn_encoder_layers = nn.ModuleList()
+        self.simplified_encoder_layers = nn.ModuleList()
+        self.fusion_conv_layers = nn.ModuleList()
+        
+        for i, num_layer in enumerate(num_layers): 
             embed_dims_i = embed_dims * num_heads[i]
             embed_dims_list.append(embed_dims_i)
-            patch_embed = PatchEmbed(
-                in_channels=in_channels,
-                embed_dims=embed_dims_i,
-                kernel_size=patch_sizes[i],
-                stride=strides[i],
-                padding=patch_sizes[i] // 2,
-                norm_cfg=norm_cfg)
             feedforward_channels_list.append(mlp_ratio * embed_dims_i)
-
-            
-            if embed_dims_i==32:
-                self.input_resolution=(64,64)
-            elif embed_dims_i==64:
-                self.input_resolution=(32,32)
-            elif embed_dims_i==160:
-                self.input_resolution=(16,16)
-            elif embed_dims_i==192:
-                self.input_resolution=(8,8)
-                
-            layer = ModuleList([
-                MLLA(
-                    dim=embed_dims_i, 
-                    input_resolution=self.input_resolution,
-                    num_heads=4,
-                    classes= i < ffn_classes
-                ) 
-                    for idx in range(num_layer)
-            ])
-           
-            in_channels = embed_dims_i
-            # The ret[0] of build_norm_layer is norm name.
-            norm = build_norm_layer(norm_cfg, embed_dims_i)[1]
-            
-            self.transformer_encoder_layers.append(ModuleList([patch_embed, layer, norm]))
-            cur += num_layer
-
-        self.cnn_encoder_layers = nn.ModuleList()
 
         for i in range(num_stages):
             self.cnn_encoder_layers.append(
@@ -819,6 +737,24 @@ class LEFormer(BaseModule):
                     padding=patch_sizes[i] // 2,
                     ffn_drop=drop_rate
                 )
+            )
+            self.simplified_encoder_layers.append(
+                SimplifiedEncoder(
+                    in_channels=self.in_channels if i == 0 else embed_dims_list[i - 1],
+                    out_channels=embed_dims_list[i],
+                    kernel_size=patch_sizes[i],
+                    stride=strides[i],
+                    padding=patch_sizes[i] // 2,
+                )
+            )
+            self.fusion_conv_layers.append(
+                Conv2d(
+                    in_channels=embed_dims_list[i] * 2,
+                    out_channels=embed_dims_list[i],
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=True)
             )
 
     def init_weights(self):
@@ -838,9 +774,12 @@ class LEFormer(BaseModule):
             super(LEFormer, self).init_weights()
 
     def forward(self, x):
+
              return self.cross_encoder_fusion(
                 x,
                 cnn_encoder_layers=self.cnn_encoder_layers,
-                transformer_encoder_layers=self.transformer_encoder_layers,
+                simplified_encoder_layers=self.simplified_encoder_layers,
+                fusion_conv_layers=self.fusion_conv_layers,
                 out_indices=self.out_indices
             )
+             
