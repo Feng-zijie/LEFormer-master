@@ -945,4 +945,4 @@ class LEFormer(BaseModule):
                 transformer_encoder_layers=self.transformer_encoder_layers,
                 out_indices=self.out_indices
             )
-             
+          
