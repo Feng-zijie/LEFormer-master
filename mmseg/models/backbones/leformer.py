@@ -378,199 +378,6 @@ class MLLA(nn.Module):
             
         return x
 
-
-class ChannelGate(nn.Module):
-    def __init__(self, gate_channels, reduction_ratio=16):
-        super(ChannelGate, self).__init__()
-        self.gate_channels = gate_channels
-        self.mlp = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(gate_channels, gate_channels // reduction_ratio),
-            nn.ReLU(),
-            nn.Linear(gate_channels // reduction_ratio, gate_channels)
-        )
-
-    def forward(self, x):
-        avg_out = self.mlp(F.avg_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))).unsqueeze(-1).unsqueeze(-1)
-        max_out = self.mlp(F.max_pool2d(x, (x.size(2), x.size(3)), stride=(x.size(2), x.size(3)))).unsqueeze(-1).unsqueeze(-1)
-        channel_att_sum = avg_out + max_out
-
-        scale = torch.sigmoid(channel_att_sum).expand_as(x)
-        return x * scale
-
-
-
-class SpatialGate(nn.Module):
-    def __init__(self):
-        super(SpatialGate, self).__init__()
-        kernel_size = 7
-        self.spatial = nn.Conv2d(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2)
-
-    def forward(self, x):
-        x_compress = torch.cat((torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
-        x_out = self.spatial(x_compress)
-        scale = torch.sigmoid(x_out)  # broadcasting
-        return x * scale
-
-
-class CBAM(nn.Module):
-    def __init__(self, gate_channels, reduction_ratio=16):
-        super(CBAM, self).__init__()
-        self.ChannelGate = ChannelGate(gate_channels, reduction_ratio)
-        self.SpatialGate = SpatialGate()
-
-    def forward(self, x):
-        x_out = self.ChannelGate(x)
-        x_out = self.SpatialGate(x_out)
-        return x_out
-
-# MDFA的空间和通道注意力模块
-class tongdao(nn.Module):  #处理通道部分   函数名就是拼音名称
-    # 通道模块初始化，输入通道数为in_channel
-    def __init__(self, in_channel):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 自适应平均池化，输出大小为1x1
-        self.fc = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于降维
-        self.relu = nn.ReLU(inplace=False)  # ReLU激活函数，就地操作以节省内存
-
-    # 前向传播函数
-    def forward(self, x):
-        b, c, _, _ = x.size()  # 提取批次大小和通道数
-        y = self.avg_pool(x)  # 应用自适应平均池化
-        y = self.fc(y)  # 应用1x1卷积
-        y = self.relu(y)  # 应用ReLU激活
-        y = nn.functional.interpolate(y, size=(x.size(2), x.size(3)), mode='nearest')  # 调整y的大小以匹配x的空间维度
-        return x * y.expand_as(x)  # 将计算得到的通道权重应用到输入x上，实现特征重校准
-
-class kongjian(nn.Module):
-    # 空间模块初始化，输入通道数为in_channel
-    def __init__(self, in_channel):
-        super().__init__()
-        self.Conv1x1 = nn.Conv2d(in_channel, 1, kernel_size=1, bias=True)  # 1x1卷积用于产生空间激励
-        self.norm = nn.Sigmoid()  # Sigmoid函数用于归一化
-
-    # 前向传播函数
-    def forward(self, x):
-        y = self.Conv1x1(x)  # 应用1x1卷积
-        y = self.norm(y)  # 应用Sigmoid函数
-        return x * y  # 将空间权重应用到输入x上，实现空间激励
-
-class hebing(nn.Module):    #函数名为合并, 意思是把空间和通道分别提取的特征合并起来
-    # 合并模块初始化，输入通道数为in_channel
-    def __init__(self, in_channel):
-        super().__init__()
-        self.tongdao = tongdao(in_channel)  # 创建通道子模块
-        self.kongjian = kongjian(in_channel)  # 创建空间子模块
-
-    # 前向传播函数
-    def forward(self, U):
-        U_kongjian = self.kongjian(U)  # 通过空间模块处理输入U
-        U_tongdao = self.tongdao(U)  # 通过通道模块处理输入U
-        return torch.max(U_tongdao, U_kongjian)  # 取两者的逐元素最大值，结合通道和空间激励
-
-
-# 修改所有 ReLU 的 inplace 参数为 False
-class MDFA(nn.Module):  # 多尺度空洞融合注意力模块
-    def __init__(self, dim_in, dim_out, rate=1, bn_mom=0.1):
-        super(MDFA, self).__init__()
-        self.branch1 = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, 1, 1, padding=0, dilation=rate, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False), 
-        )
-        self.branch2 = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, 3, 1, padding=6 * rate, dilation=6 * rate, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False), 
-        )
-        self.branch3 = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, 3, 1, padding=12 * rate, dilation=12 * rate, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False), 
-        )
-        self.branch4 = nn.Sequential(
-            nn.Conv2d(dim_in, dim_out, 3, 1, padding=18 * rate, dilation=18 * rate, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False), 
-        )
-        self.branch5_conv = nn.Conv2d(dim_in, dim_out, 1, 1, 0, bias=True)
-        self.branch5_bn = nn.BatchNorm2d(dim_out, momentum=bn_mom)
-        self.branch5_relu = nn.ReLU(inplace=False)  
-
-        self.conv_cat = nn.Sequential(
-            nn.Conv2d(dim_out * 5, dim_out, 1, 1, padding=0, bias=True),
-            nn.BatchNorm2d(dim_out, momentum=bn_mom),
-            nn.ReLU(inplace=False),
-        )
-        self.Hebing = hebing(in_channel=dim_out * 5)
-
-    def forward(self, x):
-        [b, c, row, col] = x.size()
-        conv1x1 = self.branch1(x)
-        conv3x3_1 = self.branch2(x)
-        conv3x3_2 = self.branch3(x)
-        conv3x3_3 = self.branch4(x)
-        global_feature = torch.mean(x, 2, True)
-        global_feature = torch.mean(global_feature, 3, True)
-        global_feature = self.branch5_conv(global_feature)
-        global_feature = self.branch5_bn(global_feature)
-        global_feature = self.branch5_relu(global_feature)
-        global_feature = F.interpolate(global_feature, (row, col), None, 'bilinear', True)
-        feature_cat = torch.cat([conv1x1, conv3x3_1, conv3x3_2, conv3x3_3, global_feature], dim=1)
-        larry = self.Hebing(feature_cat)
-        larry_feature_cat = larry * feature_cat
-        result = self.conv_cat(larry_feature_cat)
-        return result
-
-# Edge-Guided Attention Module
-class EGA(nn.Module):
-    def __init__(self, in_channels):
-        super(EGA, self).__init__()
-    
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(in_channels * 3, in_channels, 3, 1, 1),
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True))
-
-        self.attention = nn.Sequential(
-            nn.Conv2d(in_channels, 1, 3, 1, 1),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid())
-
-        self.cbam = CBAM(in_channels)
-        self.mdfa_block = MDFA(dim_in=in_channels, dim_out=in_channels)
-        self.pred_conv = nn.Conv2d(in_channels, 1, kernel_size=3, stride=1, padding=1)  # 用于生成 pred
-
-    def forward(self, edge_feature, x):
-        residual = x
-        xsize = x.size()[2:]
-
-        pred = torch.sigmoid(self.pred_conv(x))
-
-        # reverse attention
-        background_att = 1 - pred
-        background_x = x * background_att
-
-        # boudary attention
-        edge_pred = make_laplace(pred, 1)
-        pred_feature = x * edge_pred
-
-        # high-frequency feature
-        edge_input = F.interpolate(edge_feature, size=xsize, mode='bilinear', align_corners=True)
-        input_feature = x * edge_input
-
-        fusion_feature = torch.cat([background_x, pred_feature, input_feature], dim=1)
-        fusion_feature = self.fusion_conv(fusion_feature)
-
-        attention_map = self.attention(fusion_feature)
-        fusion_feature = fusion_feature * attention_map
-
-        out = fusion_feature + residual
-              
-        out = self.mdfa_block(out)
-     
-        return out
-
 class CnnEncoderLayer(BaseModule):
     """Implements one cnn encoder layer in LEFormer.
 
@@ -606,20 +413,11 @@ class CnnEncoderLayer(BaseModule):
         self.output_channels = output_channels
         self.act_cfg = act_cfg
         self.activate = build_activation_layer(act_cfg)
-
-        self.layers = DepthWiseConvModule(embed_dims=embed_dims,
-                                          feedforward_channels=feedforward_channels // 2,
-                                          output_channels=output_channels,
-                                          kernel_size=kernel_size,
-                                          stride=stride,
-                                          padding=padding,
-                                          act_cfg=dict(type='GELU'),
-                                          ffn_drop=ffn_drop)
-
-        self.norm = nn.BatchNorm2d(output_channels)
         
-        self.ega_block = EGA(output_channels)
-
+        self.simple_conv = nn.Conv2d(embed_dims, output_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
+        
+        self.norm = nn.BatchNorm2d(output_channels)
+    
         self.residual = nn.ModuleList([
             # 将 bias = False 改变为 bias = True
             nn.Conv2d(embed_dims, output_channels, kernel_size=7, stride=4, padding=3, bias=True),  # 普通残差  
@@ -639,13 +437,8 @@ class CnnEncoderLayer(BaseModule):
         # 第三次 x[16, 64, 32, 32] -> out1[16, 160, 16, 16] -> out2[16, 160, 16, 16]
         # 第四次 x[16, 160, 16, 16] -> out1[16, 192, 8, 8] -> out2[16, 192, 8, 8]
 
-        out = self.layers(x)
+        out = self.simple_conv(x)
         
-        
-        # out = self.multiscale_cbam(out) # 经过后 [16, 32, 64, 64] -> [16, 64, 32, 32] -> [16, 160, 16, 16] -> [16, 192, 8, 8]
-        edge_feature = make_laplace(out, channels=self.output_channels)
-        out = self.ega_block(edge_feature,out)
-
         _, _, H, W=out.shape
 
         if H == 64:
@@ -945,4 +738,4 @@ class LEFormer(BaseModule):
                 transformer_encoder_layers=self.transformer_encoder_layers,
                 out_indices=self.out_indices
             )
-          
+             
